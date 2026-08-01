@@ -51,22 +51,12 @@ fn team_resume(argv: &[String]) -> Result<String, String> {
     }
 
     let _ = writeln!(out, "\x1b[36m⏳\x1b[0m resuming team '{}' — {} agent(s)...\n", opts.name, members.len());
-    let tool_config_json: Option<serde_json::Value> = std::fs::read_to_string(&paths.tool_config)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok());
     for member in &members {
         team_validate_name(member)?;
-        let saved_engine = opts.engine.clone().or_else(|| {
-            tool_config_json.as_ref()
-                .and_then(|v| v["members"].as_array())
-                .and_then(|arr| arr.iter().find(|m| m["name"].as_str() == Some(member.as_str())))
-                .and_then(|m| m["engine"].as_str().map(str::to_owned))
-        });
         let spawn = TeamT5SpawnOptions127 {
             team: opts.name.clone(),
             role: member.clone(),
             model: opts.model.clone(),
-            engine: saved_engine,
             ..Default::default()
         };
         out.push_str(&team_t5_spawn_one(&spawn)?);
@@ -77,22 +67,18 @@ fn team_resume(argv: &[String]) -> Result<String, String> {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct TeamResumeOptions261 { name: String, model: Option<String>, engine: Option<String> }
+struct TeamResumeOptions261 { name: String, model: Option<String> }
 
 fn team_resume_parse(argv: &[String]) -> Result<TeamResumeOptions261, String> {
-    let name = argv.get(1).ok_or_else(|| "usage: maw team resume <name> [--model <model>] [--engine <engine>]".to_owned())?.clone();
+    let name = argv.get(1).ok_or_else(|| "usage: maw team resume <name> [--model <model>]".to_owned())?.clone();
     team_validate_name(&name)?;
-    let mut opts = TeamResumeOptions261 { name, model: None, engine: None };
+    let mut opts = TeamResumeOptions261 { name, model: None };
     let mut index = 2;
     while index < argv.len() {
         match argv[index].as_str() {
             "--model" => {
                 index += 1;
                 opts.model = Some(team_resume_safe_token(team_resume_next(argv, index, "--model")?, "model")?);
-            }
-            "--engine" | "-e" => {
-                index += 1;
-                opts.engine = Some(team_resume_safe_token(team_resume_next(argv, index, "--engine")?, "engine")?);
             }
             value if value.starts_with('-') => return Err(format!("team resume: unknown argument {value}")),
             value => return Err(format!("team resume: unexpected argument {value}")),
@@ -185,13 +171,6 @@ mod team_resume_tests261 {
         assert!(team_resume_parse(&team_strings(&["resume", "-bad"])).is_err());
         assert!(team_resume_parse(&team_strings(&["resume", "alpha", "--model", "--bad"])).is_err());
         assert!(team_resume_parse(&team_strings(&["resume", "alpha", "--model", "bad/model"])).is_err());
-        assert!(team_resume_parse(&team_strings(&["resume", "alpha", "--engine", "codex"])).is_ok());
-        assert!(team_resume_parse(&team_strings(&["resume", "alpha", "-e", "thclaws"])).is_ok());
-        assert!(team_resume_parse(&team_strings(&["resume", "alpha", "--engine", "bad/engine"])).is_err());
-        assert_eq!(
-            team_resume_parse(&team_strings(&["resume", "alpha", "-e", "codex"])).unwrap().engine,
-            Some("codex".to_owned())
-        );
     }
 
     #[test]
