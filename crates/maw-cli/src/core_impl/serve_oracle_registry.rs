@@ -12,7 +12,8 @@
 const SERVEORACLES_ORACLE_SUFFIX: &str = "-oracle";
 
 pub(crate) fn serveoracles_http_payload_read_only() -> Result<serde_json::Value, String> {
-    let config = config_load_layers()?.config;
+    let mut config = config_load_layers()?.config;
+    serveoracles_merge_fleet_agents(&mut config, &fleet_load_entries());
     Ok(serveoracles_payload_from_config(&config))
 }
 
@@ -30,7 +31,45 @@ pub(crate) fn serveoracles_http_payload_from_config_file(
 /// Masked config for `GET /api/config`.
 pub(crate) fn serveconfig_http_payload_read_only() -> Result<serde_json::Value, String> {
     let loaded = config_load_layers()?;
-    Ok(serveconfig_for_display(&loaded.config))
+    let mut config = loaded.config;
+    serveoracles_merge_fleet_agents(&mut config, &fleet_load_entries());
+    Ok(serveconfig_for_display(&config))
+}
+
+fn serveoracles_merge_fleet_agents(
+    config: &mut serde_json::Value,
+    fleet: &[NativeFleetEntry],
+) {
+    let local_node = config
+        .get("node")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|node| !node.is_empty())
+        .unwrap_or("local")
+        .to_owned();
+    let serde_json::Value::Object(config_map) = config else {
+        return;
+    };
+    let agents = config_map
+        .entry("agents".to_owned())
+        .or_insert_with(|| serde_json::json!({}));
+    if !agents.is_object() {
+        *agents = serde_json::json!({});
+    }
+    let Some(agents_map) = agents.as_object_mut() else {
+        return;
+    };
+    for entry in fleet.iter().filter(|entry| fleet_entry_is_session(entry)) {
+        for window in &entry.session.windows {
+            let name = window.name.trim();
+            if !name.is_empty() && !agents_map.contains_key(name) {
+                agents_map.insert(
+                    name.to_owned(),
+                    serde_json::Value::String(local_node.clone()),
+                );
+            }
+        }
+    }
 }
 
 fn serveoracles_payload_from_config(config: &serde_json::Value) -> serde_json::Value {
@@ -359,6 +398,54 @@ mod serve_oracle_registry_tests {
             display["namedPeers"]["flat"],
             "https://other.local:3456"
         );
+    }
+
+    #[test]
+    fn serveoracles_real_loader_merges_fleet_windows_into_agents() {
+        let _lock = env_test_lock();
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "maw-rs-serveoracles-fleet-{}-{unique}",
+            std::process::id()
+        ));
+        let _home = EnvVarRestore::capture("HOME");
+        let _maw_home = EnvVarRestore::capture("MAW_HOME");
+        let _config = EnvVarRestore::capture("MAW_CONFIG_DIR");
+        let config_dir = root.join("config");
+        let fleet_dir = root.join("home/.maw/fleet");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&config_dir).expect("config dir");
+        std::fs::create_dir_all(&fleet_dir).expect("fleet dir");
+        std::fs::write(
+            config_dir.join("maw.config.json"),
+            r#"{"node":"m5","agents":{"atlas":"remote"},"sessions":{},"commands":{}}"#,
+        )
+        .expect("config");
+        std::fs::write(
+            fleet_dir.join("t4532-summon.json"),
+            r#"{"name":"t4532-summon","windows":[{"name":"coder-serve-oracle","repo":"arnon2020/maw-rs"},{"name":"verifier-x-oracle","repo":"arnon2020/maw-rs"},{"name":"claim-verifier","repo":"arnon2020/lucifer-oracle"}]}"#,
+        )
+        .expect("fleet");
+        std::env::set_var("HOME", root.join("home"));
+        std::env::remove_var("MAW_HOME");
+        std::env::set_var("MAW_CONFIG_DIR", &config_dir);
+
+        let roster = serveoracles_http_payload_read_only().expect("roster");
+        let names = roster["oracles"].to_string();
+        assert!(names.contains("coder-serve"), "{names}");
+        assert!(names.contains("verifier-x"), "{names}");
+        assert!(names.contains("claim-verifier"), "{names}");
+
+        let display = serveconfig_http_payload_read_only().expect("config display");
+        assert_eq!(display["agents"]["atlas"], "remote");
+        assert_eq!(display["agents"]["coder-serve-oracle"], "m5");
+        assert_eq!(display["agents"]["verifier-x-oracle"], "m5");
+        assert_eq!(display["agents"]["claim-verifier"], "m5");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
