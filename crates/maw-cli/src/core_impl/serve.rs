@@ -126,12 +126,9 @@ impl ServeWakeExecutor for ServeSystemWakeExecutor {
     }
 }
 
-/// Fleet membership — the one fact `AutoWakeSite::ApiSend` needs from this node.
-///
-/// maw-js answers it with `resolveFleetSession(target)`; the squad files under
-/// the fleet dirs are that same registry. Behind a trait because the auto-wake
-/// branch is only testable if a target can be declared known or unknown without
-/// writing squad files to the developer's real fleet.
+/// Wake resolvability — the one fact `AutoWakeSite::ApiSend` needs from this
+/// node. The trait keeps the auto-wake branch testable without consulting the
+/// developer's real repos and fleet registry.
 trait ServeFleetRegistry: Send + Sync {
     fn fleet_known(&self, target: &str) -> bool;
 }
@@ -140,54 +137,9 @@ struct ServeSystemFleetRegistry;
 
 impl ServeFleetRegistry for ServeSystemFleetRegistry {
     fn fleet_known(&self, target: &str) -> bool {
-        serve_fleet_known_in(&fleet_load_entries(), target)
+        let sessions = TmuxClient::local().list_all();
+        wake_target_is_resolvable(target, &sessions)
     }
-}
-
-/// A target counts as fleet-known when it names a squad file, a session, or a
-/// window inside one — `atlas`, `atlas:coder-1` and a bare `coder-1` all
-/// resolve, matching what `maw wake` accepts.
-fn serve_fleet_known_in(entries: &[NativeFleetEntry], target: &str) -> bool {
-    let needle = target.trim();
-    if needle.is_empty() {
-        return false;
-    }
-    let (session_part, window_part) = needle
-        .split_once(':')
-        .map_or((needle, None), |(session, window)| (session, Some(window)));
-    entries.iter().any(|entry| {
-        let session_matches = serve_fleet_name_eq(&entry.session.name, session_part)
-            || serve_fleet_name_eq(&entry.file, session_part);
-        window_part.map_or_else(
-            || {
-                session_matches
-                    || entry
-                        .session
-                        .windows
-                        .iter()
-                        .any(|window| serve_fleet_name_eq(&window.name, needle))
-            },
-            |window_name| {
-                // Qualified `session:window` must match both halves; a window
-                // name alone is not enough to claim the named session hosts it.
-                session_matches
-                    && entry
-                        .session
-                        .windows
-                        .iter()
-                        .any(|window| serve_fleet_name_eq(&window.name, window_name))
-            },
-        )
-    })
-}
-
-fn serve_fleet_name_eq(candidate: &str, needle: &str) -> bool {
-    let candidate = candidate.trim();
-    let needle = needle.trim();
-    candidate.eq_ignore_ascii_case(needle)
-        || candidate
-            .strip_suffix(".json")
-            .is_some_and(|stem| stem.eq_ignore_ascii_case(needle))
 }
 
 trait ServeReceiverInbox: Send + Sync {
