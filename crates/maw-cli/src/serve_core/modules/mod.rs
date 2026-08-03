@@ -16,6 +16,7 @@ pub mod federation_routes;
 pub mod god_mode_ui;
 pub mod identity_routes;
 pub mod info_routes;
+pub mod oracle_registry_routes;
 pub mod pairing;
 pub mod people_routes;
 pub mod static_views;
@@ -65,6 +66,7 @@ where
         god_mode_ui::godui_registration(),
         identity_routes::identity_registration(),
         info_routes::info_registration(),
+        oracle_registry_routes::oracles_registration(),
         pairing::pair_registration(),
         people_routes::people_registration(),
         thread_routes::threadstore_registration(),

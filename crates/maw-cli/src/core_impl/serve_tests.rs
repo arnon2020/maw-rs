@@ -194,6 +194,14 @@ mod serve_tests {
             *self.sessions.lock().expect("sessions") = sessions;
         }
 
+        fn set_list_error_once(&self, error: &str) {
+            *self.list_error.lock().expect("list error") = Some(error.to_owned());
+        }
+
+        fn set_send_error(&self, error: &str) {
+            *self.send_error.lock().expect("send error") = Some(error.to_owned());
+        }
+
         fn set_capture(&self, target: &str, capture: &str) {
             self.captures
                 .lock()
@@ -208,7 +216,7 @@ mod serve_tests {
 
     impl ServeDelivery for FakeServeDelivery {
         fn route_sessions(&self) -> Result<Vec<RouteSession>, String> {
-            if let Some(error) = self.list_error.lock().expect("list error").clone() {
+            if let Some(error) = self.list_error.lock().expect("list error").take() {
                 return Err(error);
             }
             let mut sessions = self.sessions.lock().expect("sessions");
@@ -290,6 +298,30 @@ mod serve_tests {
         Arc::new(FakeServeWake::default())
     }
 
+    /// Declares fleet membership without writing squad files to the real fleet.
+    #[derive(Default)]
+    struct FakeServeFleet {
+        known: Vec<String>,
+    }
+
+    impl ServeFleetRegistry for FakeServeFleet {
+        fn fleet_known(&self, target: &str) -> bool {
+            self.known.iter().any(|name| name == target)
+        }
+    }
+
+    /// Default fake knows nobody, so no existing test can start auto-waking as
+    /// a side effect of this field appearing.
+    fn serve_test_fleet() -> Arc<dyn ServeFleetRegistry> {
+        Arc::new(FakeServeFleet::default())
+    }
+
+    fn serve_test_fleet_knowing(names: &[&str]) -> Arc<dyn ServeFleetRegistry> {
+        Arc::new(FakeServeFleet {
+            known: names.iter().map(|name| (*name).to_owned()).collect(),
+        })
+    }
+
     fn serve_test_receiver_inbox() -> Arc<dyn ServeReceiverInbox> {
         Arc::new(ServeSystemReceiverInbox {
             enabled: Some(false),
@@ -340,6 +372,7 @@ mod serve_tests {
             delivery: serve_test_delivery(),
             receiver_inbox: serve_test_receiver_inbox(),
             wake: serve_test_wake(),
+            fleet: serve_test_fleet(),
             delivery_idempotency: Mutex::new(DeliveryIdempotencyStore::default()),
             feed: Mutex::new(Vec::new()),
             peer_addr_override: Some(NON_LOOPBACK_TEST_PEER),
@@ -356,15 +389,50 @@ mod serve_tests {
         trust_store_path: std::path::PathBuf,
         wake: Arc<dyn ServeWakeExecutor>,
     ) -> Router {
+        serve_test_app_with_wake_and_fleet(trust_store_path, wake, serve_test_fleet())
+    }
+
+    fn serve_test_app_with_wake_and_fleet(
+        trust_store_path: std::path::PathBuf,
+        wake: Arc<dyn ServeWakeExecutor>,
+        fleet: Arc<dyn ServeFleetRegistry>,
+    ) -> Router {
+        serve_test_app_with_wake_fleet_and_inbox(
+            trust_store_path,
+            wake,
+            fleet,
+            serve_test_receiver_inbox(),
+        )
+    }
+
+    fn serve_test_app_with_wake_fleet_and_inbox(
+        trust_store_path: std::path::PathBuf,
+        wake: Arc<dyn ServeWakeExecutor>,
+        fleet: Arc<dyn ServeFleetRegistry>,
+        receiver_inbox: Arc<dyn ServeReceiverInbox>,
+    ) -> Router {
+        let delivery = Arc::new(FakeServeDelivery::with_capture_agent());
+        delivery.set_sessions(vec![
+            vec![
+                serve_test_session("capture-agent", 0, "capture-agent"),
+                serve_test_session("remote-oracle", 0, "remote-oracle"),
+            ],
+            vec![
+                serve_test_session("capture-agent", 0, "capture-agent"),
+                serve_test_session("remote-oracle", 0, "remote-oracle"),
+                serve_test_session("atlas", 0, "atlas"),
+            ],
+        ]);
         serve_router(ServeState {
             cached_pubkey: Some(KEY.to_owned()),
             peer_pubkeys: HotReload::frozen(Vec::new()),
             workspace_key: Some(KEY.to_owned()),
             workspaces: Mutex::new(WorkspaceStore::default()),
             requests: Mutex::new(RequestReplyStore::default()),
-            delivery: serve_test_delivery(),
-            receiver_inbox: serve_test_receiver_inbox(),
+            delivery,
+            receiver_inbox,
             wake,
+            fleet,
             delivery_idempotency: Mutex::new(DeliveryIdempotencyStore::default()),
             feed: Mutex::new(Vec::new()),
             peer_addr_override: Some(NON_LOOPBACK_TEST_PEER),
@@ -387,6 +455,7 @@ mod serve_tests {
             delivery: serve_test_delivery(),
             receiver_inbox: serve_test_receiver_inbox(),
             wake: serve_test_wake(),
+            fleet: serve_test_fleet(),
             delivery_idempotency: Mutex::new(DeliveryIdempotencyStore::default()),
             feed: Mutex::new(Vec::new()),
             peer_addr_override: Some(NON_LOOPBACK_TEST_PEER),
@@ -409,6 +478,7 @@ mod serve_tests {
             delivery: serve_test_delivery(),
             receiver_inbox: serve_test_receiver_inbox(),
             wake: serve_test_wake(),
+            fleet: serve_test_fleet(),
             delivery_idempotency: Mutex::new(DeliveryIdempotencyStore::default()),
             feed: Mutex::new(Vec::new()),
             peer_addr_override: Some(NON_LOOPBACK_TEST_PEER),
@@ -525,6 +595,7 @@ mod serve_tests {
             delivery,
             receiver_inbox,
             wake: serve_test_wake(),
+            fleet: serve_test_fleet(),
             delivery_idempotency: Mutex::new(DeliveryIdempotencyStore::default()),
             feed: Mutex::new(Vec::new()),
             peer_addr_override,
@@ -678,6 +749,173 @@ mod serve_tests {
             .expect("error")
             .contains("repo not found for bare-shell"));
         assert!(wake.wakes().is_empty());
+    }
+
+    #[tokio::test]
+    async fn serve_send_wakes_known_dormant_target_once_before_delivery() {
+        let wake = Arc::new(FakeServeWake::default());
+        let app = serve_test_app_with_wake_and_fleet(
+            serve_test_trust_store_path("send-auto-wake"),
+            wake.clone(),
+            serve_test_fleet_knowing(&["atlas"]),
+        );
+        let body = r#"{"target":"atlas","text":"wake then deliver"}"#;
+        let response = app
+            .oneshot(signed_api_send_json_request(body, KEY, FROM, 1_782_277_200))
+            .await
+            .expect("response");
+        let status = response.status();
+        let payload = response_json(response).await;
+        assert_eq!(status, StatusCode::OK, "{payload}");
+        assert_eq!(payload["ok"], true);
+        assert_eq!(payload["state"], "delivered");
+        assert_eq!(payload["wokeFor"], "atlas");
+        assert_eq!(wake.wakes(), vec![("atlas".to_owned(), None)]);
+    }
+
+    #[tokio::test]
+    async fn serve_send_keeps_unknown_target_unwoken_and_not_found() {
+        let wake = Arc::new(FakeServeWake::default());
+        let app = serve_test_app_with_wake_and_fleet(
+            serve_test_trust_store_path("send-unknown-no-wake"),
+            wake.clone(),
+            serve_test_fleet_knowing(&["atlas"]),
+        );
+        let body = r#"{"target":"atals","text":"typo must stay a typo"}"#;
+        let response = app
+            .oneshot(signed_api_send_json_request(body, KEY, FROM, 1_782_277_200))
+            .await
+            .expect("response");
+        let status = response.status();
+        let payload = response_json(response).await;
+        // Typos must remain harmless 404s instead of spawning arbitrary sessions.
+        assert_eq!(status, StatusCode::NOT_FOUND, "{payload}");
+        assert_eq!(payload["ok"], false);
+        assert!(wake.wakes().is_empty());
+    }
+
+    #[tokio::test]
+    async fn serve_send_keeps_unknown_target_unwoken_with_inbox_fallback_enabled() {
+        let repo = serve_test_inbox_repo("unknown-no-wake");
+        let wake = Arc::new(FakeServeWake::default());
+        let app = serve_test_app_with_wake_fleet_and_inbox(
+            serve_test_trust_store_path("send-unknown-no-wake-inbox"),
+            wake.clone(),
+            serve_test_fleet_knowing(&["atlas"]),
+            serve_test_receiver_inbox_at(&repo, 1_782_277_200_000),
+        );
+        let body = r#"{"target":"atals","text":"typo may queue but must not wake"}"#;
+        let _response = app
+            .oneshot(signed_api_send_json_request(body, KEY, FROM, 1_782_277_200))
+            .await
+            .expect("response");
+        // Enabled inbox fallback may legitimately return queued or failed; only
+        // the safety invariant matters here: an unknown target must never wake.
+        assert!(wake.wakes().is_empty());
+    }
+
+    #[tokio::test]
+    async fn serve_send_preserves_not_found_when_auto_wake_fails() {
+        let wake = Arc::new(FakeServeWake::default());
+        wake.set_error("wake failed");
+        let app = serve_test_app_with_wake_and_fleet(
+            serve_test_trust_store_path("send-auto-wake-fails"),
+            wake,
+            serve_test_fleet_knowing(&["atlas"]),
+        );
+        let body = r#"{"target":"atlas","text":"wake failure stays not found"}"#;
+        let response = app
+            .oneshot(signed_api_send_json_request(body, KEY, FROM, 1_782_277_200))
+            .await
+            .expect("response");
+        let status = response.status();
+        let payload = response_json(response).await;
+        // A best-effort wake must not replace the original routing contract with a 5xx.
+        assert_eq!(status, StatusCode::NOT_FOUND, "{payload}");
+        assert_eq!(payload["ok"], false);
+        assert_eq!(payload["state"], "failed");
+        assert!(payload.get("wokeFor").is_none());
+    }
+
+    #[tokio::test]
+    async fn serve_send_ordinary_delivery_omits_woke_for() {
+        let app = serve_test_app(serve_test_trust_store_path("send-no-woke-for"));
+        let body = r#"{"target":"capture-agent","text":"ordinary delivery"}"#;
+        let response = app
+            .oneshot(signed_api_send_json_request(body, KEY, FROM, 1_782_277_200))
+            .await
+            .expect("response");
+        let status = response.status();
+        let payload = response_json(response).await;
+        assert_eq!(status, StatusCode::OK, "{payload}");
+        assert_eq!(payload["state"], "delivered");
+        assert!(payload.get("wokeFor").is_none());
+    }
+
+    #[tokio::test]
+    async fn serve_wake_accepts_legacy_oracle_alias_but_still_requires_a_target() {
+        let wake = Arc::new(FakeServeWake::default());
+        let app = serve_test_app_with_wake(
+            serve_test_trust_store_path("wake-oracle-alias"),
+            wake.clone(),
+        );
+
+        let oracle_only = r#"{"oracle":"atlas"}"#;
+        let response = app
+            .clone()
+            .oneshot(signed_json_request(
+                "POST",
+                "/api/wake",
+                oracle_only,
+                KEY,
+                FROM,
+                1_782_277_200,
+            ))
+            .await
+            .expect("oracle-only response");
+        let status = response.status();
+        let payload = response_json(response).await;
+        assert_eq!(status, StatusCode::OK, "{payload}");
+        assert_eq!(payload["ok"], true);
+
+        let empty_target = r#"{"target":"","oracle":"atlas"}"#;
+        let response = app
+            .clone()
+            .oneshot(signed_json_request(
+                "POST",
+                "/api/wake",
+                empty_target,
+                KEY,
+                FROM,
+                1_782_277_200,
+            ))
+            .await
+            .expect("empty-target alias response");
+        let status = response.status();
+        let payload = response_json(response).await;
+        assert_eq!(status, StatusCode::OK, "{payload}");
+        assert_eq!(payload["ok"], true);
+
+        let neither = "{}";
+        let response = app
+            .oneshot(signed_json_request(
+                "POST",
+                "/api/wake",
+                neither,
+                KEY,
+                FROM,
+                1_782_277_200,
+            ))
+            .await
+            .expect("missing-target response");
+        let status = response.status();
+        let payload = response_json(response).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{payload}");
+        assert_eq!(payload["error"], "empty-target");
+        assert_eq!(
+            wake.wakes(),
+            vec![("atlas".to_owned(), None), ("atlas".to_owned(), None)]
+        );
     }
 
     // Regression test for #533: `run_wake_command` takes a VERB-STRIPPED argv
@@ -906,6 +1144,50 @@ mod serve_tests {
                 "capture-agent:0".to_owned(),
                 "[alloy:bigboy-vps] another turn between duplicate emissions".to_owned()
             )
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_api_send_identical_retry_writes_one_inbox_across_failure_paths() {
+        let repo = serve_test_inbox_repo("cross-path-dedup");
+        let inbox_dir = repo.join("ψ").join("inbox");
+        let delivery = Arc::new(FakeServeDelivery::default());
+        delivery.set_sessions(vec![vec![serve_test_session("atlas", 0, "atlas")]]);
+        delivery.set_list_error_once("tmux list failed");
+        delivery.set_send_error("tmux send failed");
+        let app = serve_test_app_with_o6_keys_delivery_and_inbox(
+            vec![serve_test_peer_pubkey(FROM, KEY)],
+            1_782_277_200,
+            Some(NON_LOOPBACK_TEST_PEER),
+            delivery,
+            serve_test_receiver_inbox_at(&repo, 1_782_277_200_000),
+        );
+        let body = r#"{"target":"atlas","text":"hi"}"#;
+
+        let first = app
+            .clone()
+            .oneshot(signed_api_send_json_request(body, KEY, FROM, 1_782_277_200))
+            .await
+            .expect("first response");
+        let first_status = first.status();
+        let first_payload = response_json(first).await;
+        assert_eq!(first_status, StatusCode::OK, "{first_payload}");
+        assert_eq!(first_payload["state"], "queued");
+
+        let retry = app
+            .oneshot(signed_api_send_json_request(body, KEY, FROM, 1_782_277_200))
+            .await
+            .expect("retry response");
+        let retry_status = retry.status();
+        let retry_payload = response_json(retry).await;
+        assert_eq!(retry_status, StatusCode::OK, "{retry_payload}");
+
+        let inbox_writes = std::fs::read_dir(&inbox_dir)
+            .expect("receiver inbox")
+            .count();
+        assert_eq!(
+            inbox_writes, 1,
+            "an identical retry crossing fallback paths must not write the receiver inbox twice"
         );
     }
 
@@ -1732,6 +2014,7 @@ mod serve_tests {
             delivery: serve_test_delivery(),
             receiver_inbox: serve_test_receiver_inbox(),
             wake: serve_test_wake(),
+            fleet: serve_test_fleet(),
             delivery_idempotency: Mutex::new(DeliveryIdempotencyStore::default()),
             feed: Mutex::new(Vec::new()),
             peer_addr_override: Some(NON_LOOPBACK_TEST_PEER),
@@ -1961,6 +2244,7 @@ mod serve_tests {
             delivery: serve_test_delivery(),
             receiver_inbox: serve_test_receiver_inbox(),
             wake: serve_test_wake(),
+            fleet: serve_test_fleet(),
             delivery_idempotency: Mutex::new(DeliveryIdempotencyStore::default()),
             feed: Mutex::new(Vec::new()),
             peer_addr_override: Some(NON_LOOPBACK_TEST_PEER),
@@ -2294,6 +2578,7 @@ mod serve_tests {
             delivery: serve_test_delivery(),
             receiver_inbox: serve_test_receiver_inbox(),
             wake: serve_test_wake(),
+            fleet: serve_test_fleet(),
             delivery_idempotency: Mutex::new(DeliveryIdempotencyStore::default()),
             feed: Mutex::new(Vec::new()),
             peer_addr_override: Some(NON_LOOPBACK_TEST_PEER),

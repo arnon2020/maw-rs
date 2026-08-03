@@ -44,6 +44,7 @@ struct ServeState {
     delivery: Arc<dyn ServeDelivery>,
     receiver_inbox: Arc<dyn ServeReceiverInbox>,
     wake: Arc<dyn ServeWakeExecutor>,
+    fleet: Arc<dyn ServeFleetRegistry>,
     delivery_idempotency: Mutex<DeliveryIdempotencyStore>,
     feed: Mutex<Vec<Value>>,
     #[cfg(test)]
@@ -123,6 +124,70 @@ impl ServeWakeExecutor for ServeSystemWakeExecutor {
         let detail = if detail.is_empty() { "wake failed" } else { detail };
         Err(format!("wake exited {}: {detail}", output.code))
     }
+}
+
+/// Fleet membership — the one fact `AutoWakeSite::ApiSend` needs from this node.
+///
+/// maw-js answers it with `resolveFleetSession(target)`; the squad files under
+/// the fleet dirs are that same registry. Behind a trait because the auto-wake
+/// branch is only testable if a target can be declared known or unknown without
+/// writing squad files to the developer's real fleet.
+trait ServeFleetRegistry: Send + Sync {
+    fn fleet_known(&self, target: &str) -> bool;
+}
+
+struct ServeSystemFleetRegistry;
+
+impl ServeFleetRegistry for ServeSystemFleetRegistry {
+    fn fleet_known(&self, target: &str) -> bool {
+        serve_fleet_known_in(&fleet_load_entries(), target)
+    }
+}
+
+/// A target counts as fleet-known when it names a squad file, a session, or a
+/// window inside one — `atlas`, `atlas:coder-1` and a bare `coder-1` all
+/// resolve, matching what `maw wake` accepts.
+fn serve_fleet_known_in(entries: &[NativeFleetEntry], target: &str) -> bool {
+    let needle = target.trim();
+    if needle.is_empty() {
+        return false;
+    }
+    let (session_part, window_part) = needle
+        .split_once(':')
+        .map_or((needle, None), |(session, window)| (session, Some(window)));
+    entries.iter().any(|entry| {
+        let session_matches = serve_fleet_name_eq(&entry.session.name, session_part)
+            || serve_fleet_name_eq(&entry.file, session_part);
+        window_part.map_or_else(
+            || {
+                session_matches
+                    || entry
+                        .session
+                        .windows
+                        .iter()
+                        .any(|window| serve_fleet_name_eq(&window.name, needle))
+            },
+            |window_name| {
+                // Qualified `session:window` must match both halves; a window
+                // name alone is not enough to claim the named session hosts it.
+                session_matches
+                    && entry
+                        .session
+                        .windows
+                        .iter()
+                        .any(|window| serve_fleet_name_eq(&window.name, window_name))
+            },
+        )
+    })
+}
+
+fn serve_fleet_name_eq(candidate: &str, needle: &str) -> bool {
+    let candidate = candidate.trim();
+    let needle = needle.trim();
+    candidate.eq_ignore_ascii_case(needle)
+        || candidate
+            .strip_suffix(".json")
+            .is_some_and(|stem| stem.eq_ignore_ascii_case(needle))
 }
 
 trait ServeReceiverInbox: Send + Sync {
@@ -269,6 +334,7 @@ async fn run_serve_async_impl(raw_args: &[String]) -> CliOutput {
         delivery: Arc::new(ServeSystemDelivery),
         receiver_inbox: Arc::new(ServeSystemReceiverInbox::default()),
         wake: Arc::new(ServeSystemWakeExecutor),
+        fleet: Arc::new(ServeSystemFleetRegistry),
         delivery_idempotency: Mutex::new(DeliveryIdempotencyStore::default()),
         feed: Mutex::new(Vec::new()),
         #[cfg(test)]
@@ -636,6 +702,7 @@ fn serve_deliver_send(
     let from = (!raw_from.trim().is_empty()).then_some(raw_from);
     let config = load_hey_config();
     let sender_oracle = resolve_hey_sender_oracle(&config);
+    let response_text = parsed.text.clone().unwrap_or_default();
     let log_from = from
         .clone()
         .unwrap_or_else(|| serve_local_identity(&config, &sender_oracle));
@@ -666,41 +733,242 @@ fn serve_deliver_send(
         Ok(sessions) => sessions,
         Err(error) => {
             serve_log_delivery_failed(state, &target, &message, &log_from, &log_to, &error, "route-list");
-            return serve_delivery_error(StatusCode::SERVICE_UNAVAILABLE, "route-list-failed", &target, &error);
+            return serve_queue_or_fail(
+                state,
+                headers,
+                &ServeQueueContext {
+                    config: &config,
+                    sender_oracle: &sender_oracle,
+                    log_from: &log_from,
+                    log_to: &log_to,
+                    requested: &target,
+                    resolved: &target,
+                    message: &message,
+                    response_text: &response_text,
+                },
+                ServeQueueIdempotency::Unclaimed,
+                &ServeDeliveryFailure {
+                    status: StatusCode::SERVICE_UNAVAILABLE,
+                    error: "route-list-failed",
+                    target: &target,
+                    detail: &error,
+                    reason: &format!("tmux unavailable: {error}"),
+                },
+            );
         }
     };
 
-    match resolve_route_target(&target, &config.route, &sessions) {
+    serve_deliver_send_resolved(
+        state,
+        headers,
+        &ServeSendContext {
+            config: &config,
+            sender_oracle: &sender_oracle,
+            from: from.as_deref(),
+            log_from: &log_from,
+            log_to: &log_to,
+            target: &target,
+            message: &message,
+            response_text: &response_text,
+        },
+        resolve_route_target(&target, &config.route, &sessions),
+    )
+}
+
+struct ServeSendContext<'a> {
+    config: &'a HeyConfig,
+    sender_oracle: &'a str,
+    from: Option<&'a str>,
+    log_from: &'a str,
+    log_to: &'a str,
+    target: &'a str,
+    message: &'a str,
+    response_text: &'a str,
+}
+
+fn serve_deliver_send_resolved(
+    state: &ServeState,
+    headers: &HeaderMap,
+    context: &ServeSendContext<'_>,
+    route: RouteResult,
+) -> axum::response::Response {
+    match route {
         RouteResult::Local { target: resolved } | RouteResult::SelfNode { target: resolved } => {
-            let context = ServeDeliverContext {
-                config: &config,
-                sender_oracle: &sender_oracle,
-                from: from.as_deref(),
-                log_from: &log_from,
-                log_to: &log_to,
-                requested: &target,
+            let deliver_context = ServeDeliverContext {
+                config: context.config,
+                sender_oracle: context.sender_oracle,
+                from: context.from,
+                headers,
+                log_from: context.log_from,
+                log_to: context.log_to,
+                requested: context.target,
                 resolved: &resolved,
-                message: &message,
+                message: context.message,
+                response_text: context.response_text,
                 idempotency_key: serve_delivery_idempotency_key(
                     headers,
-                    &log_from,
-                    &resolved,
-                    &message,
+                    context.log_from,
+                    context.target,
+                    context.message,
                 ),
+                woke_for: None,
             };
-            serve_deliver_local(state, &context)
+            serve_deliver_local(state, &deliver_context)
         }
         RouteResult::Peer { node, .. } => {
             let error = format!("peer-forward-unavailable:{node}");
-            serve_log_delivery_failed(state, &target, &message, &log_from, &log_to, &error, "peer-forward");
-            serve_delivery_error(StatusCode::BAD_GATEWAY, "peer-forward-unavailable", &target, &error)
+            serve_log_delivery_failed(
+                state,
+                context.target,
+                context.message,
+                context.log_from,
+                context.log_to,
+                &error,
+                "peer-forward",
+            );
+            serve_delivery_error(
+                StatusCode::BAD_GATEWAY,
+                "peer-forward-unavailable",
+                context.target,
+                &error,
+            )
         }
         RouteResult::Error { reason, detail, .. } => {
+            // #835 parity: a fleet-known target that simply is not up yet earns
+            // one wake and one re-resolve before this becomes a 404. The policy
+            // itself refuses unknown targets, so they still 404 unwoken.
+            if let Some(response) = serve_send_after_auto_wake(
+                state,
+                headers,
+                &ServeAutoWakeContext {
+                    config: context.config,
+                    sender_oracle: context.sender_oracle,
+                    from: context.from,
+                    log_from: context.log_from,
+                    log_to: context.log_to,
+                    target: context.target,
+                    message: context.message,
+                    response_text: context.response_text,
+                },
+            ) {
+                return response;
+            }
             let error = format!("{reason}: {detail}");
-            serve_log_delivery_failed(state, &target, &message, &log_from, &log_to, &error, "resolve");
-            serve_delivery_error(StatusCode::NOT_FOUND, &reason, &target, &detail)
+            serve_log_delivery_failed(
+                state,
+                context.target,
+                context.message,
+                context.log_from,
+                context.log_to,
+                &error,
+                "resolve",
+            );
+            serve_queue_or_fail(
+                state,
+                headers,
+                &ServeQueueContext {
+                    config: context.config,
+                    sender_oracle: context.sender_oracle,
+                    log_from: context.log_from,
+                    log_to: context.log_to,
+                    requested: context.target,
+                    resolved: context.target,
+                    message: context.message,
+                    response_text: context.response_text,
+                },
+                ServeQueueIdempotency::Unclaimed,
+                &ServeDeliveryFailure {
+                    status: StatusCode::NOT_FOUND,
+                    error: &reason,
+                    target: context.target,
+                    detail: &detail,
+                    reason: &detail,
+                },
+            )
         }
     }
+}
+
+struct ServeAutoWakeContext<'a> {
+    config: &'a HeyConfig,
+    sender_oracle: &'a str,
+    from: Option<&'a str>,
+    log_from: &'a str,
+    log_to: &'a str,
+    target: &'a str,
+    message: &'a str,
+    response_text: &'a str,
+}
+
+/// Wake a dormant fleet member, then deliver — maw-js `sessions.ts` #835.
+///
+/// `None` means "this was not an auto-wake case, or the wake did not produce a
+/// deliverable target": every such path returns to the caller's original 404
+/// rather than inventing a new failure, so the endpoint's contract for unknown
+/// targets is unchanged.
+fn serve_send_after_auto_wake(
+    state: &ServeState,
+    headers: &HeaderMap,
+    context: &ServeAutoWakeContext<'_>,
+) -> Option<axum::response::Response> {
+    let decision = should_auto_wake(
+        context.target,
+        AutoWakeOptions {
+            site: AutoWakeSite::ApiSend,
+            // The target failed to resolve against live sessions a moment ago,
+            // which is exactly what "not live" means at this call site.
+            is_live: Some(false),
+            is_fleet_known: Some(state.fleet.fleet_known(context.target)),
+            ..AutoWakeOptions::default()
+        },
+    );
+    if !decision.wake {
+        return None;
+    }
+    if let Err(error) = state.wake.execute_wake(context.target, None) {
+        serve_log_lifecycle(
+            state,
+            json!({
+                "kind": "message",
+                "direction": "inbound",
+                "state": "failed",
+                "event": "auto-wake-failed",
+                "route": "auto-wake",
+                "target": context.target,
+                "error": serve_truncate(&error, SERVE_LOG_ERROR_MAX),
+                "source": "maw-rs-native",
+            }),
+        );
+        return None;
+    }
+    let sessions = state.delivery.route_sessions().ok()?;
+    let (RouteResult::Local { target: resolved } | RouteResult::SelfNode { target: resolved }) =
+        resolve_route_target(context.target, &context.config.route, &sessions)
+    else {
+        return None;
+    };
+    Some(serve_deliver_local(
+        state,
+        &ServeDeliverContext {
+            config: context.config,
+            sender_oracle: context.sender_oracle,
+            from: context.from,
+            headers,
+            log_from: context.log_from,
+            log_to: context.log_to,
+            requested: context.target,
+            resolved: &resolved,
+            message: context.message,
+            response_text: context.response_text,
+            idempotency_key: serve_delivery_idempotency_key(
+                headers,
+                context.log_from,
+                context.target,
+                context.message,
+            ),
+            woke_for: Some(context.target),
+        },
+    ))
 }
 
 
@@ -753,57 +1021,24 @@ fn serve_deliver_inbox(
         ServeInboxIdempotencyClaim::Claimed(key) => key,
         ServeInboxIdempotencyClaim::Duplicate(response) => return *response,
     };
-    let from = serve_display_from(headers, config, context.sender_oracle);
-    match state.receiver_inbox.write_receiver_inbox(ReceiverInboxInput {
-        query: target,
-        target: Some(&resolved),
-        to: Some(target),
-        from: &from,
-        message,
-        config,
-    }) {
-        ReceiverInboxResult::Ok(inbox) => {
-            let reason = "--inbox requested; pane injection skipped";
-            if let Some(key) = idempotency_key.clone() {
-                serve_delivery_idempotency_complete(
-                    state,
-                    key,
-                    &resolved,
-                    "queued",
-                    serve_delivery_idempotency_now(state),
-                );
-            }
-            serve_log_lifecycle(
-                state,
-                json!({
-                    "kind": "context.message",
-                    "direction": "inbound",
-                    "state": "queued",
-                    "route": "inbox",
-                    "from": serve_truncate(&from, SERVE_LOG_TEXT_MAX),
-                    "to": serve_truncate(log_to, SERVE_LOG_TEXT_MAX),
-                    "target": resolved,
-                    "requestedTarget": target,
-                    "text": serve_truncate(message, SERVE_LOG_TEXT_MAX),
-                    "oracle": inbox.oracle,
-                    "lastLine": reason,
-                    "signed": !header_to_string(headers, "x-maw-from").trim().is_empty(),
-                    "source": "maw-rs-native",
-                }),
-            );
-            Json(json!({
-                "ok": true,
-                "target": resolved,
-                "text": parsed.text.clone().unwrap_or_default(),
-                "source": "inbox",
-                "state": "queued",
-                "inbox": inbox.path.display().to_string(),
-                "reason": reason,
-                "receipt": ["fallback_queued"],
-            }))
-            .into_response()
-        }
-        ReceiverInboxResult::Err { oracle: _, reason } => {
+    match serve_write_receiver_inbox(
+        state,
+        headers,
+        &ServeQueueContext {
+            config,
+            sender_oracle: context.sender_oracle,
+            log_from,
+            log_to,
+            requested: target,
+            resolved: &resolved,
+            message,
+            response_text: &parsed.text.clone().unwrap_or_default(),
+        },
+        "--inbox requested; pane injection skipped",
+        idempotency_key.as_ref(),
+    ) {
+        Ok(response) => response,
+        Err(reason) => {
             if let Some(key) = idempotency_key.as_ref() {
                 serve_delivery_idempotency_cancel(state, key);
             }
@@ -836,36 +1071,232 @@ struct ServeDeliverContext<'a> {
     config: &'a HeyConfig,
     sender_oracle: &'a str,
     from: Option<&'a str>,
+    headers: &'a HeaderMap,
     log_from: &'a str,
     log_to: &'a str,
     requested: &'a str,
     resolved: &'a str,
     message: &'a str,
+    response_text: &'a str,
     idempotency_key: Option<DeliveryIdempotencyKey>,
+    /// Set when this delivery only became possible because the target was woken
+    /// first; surfaced as `wokeFor` so a caller can tell an ordinary send from
+    /// one that started a session as a side effect.
+    woke_for: Option<&'a str>,
 }
 
+struct ServeQueueContext<'a> {
+    config: &'a HeyConfig,
+    sender_oracle: &'a str,
+    log_from: &'a str,
+    log_to: &'a str,
+    requested: &'a str,
+    resolved: &'a str,
+    message: &'a str,
+    response_text: &'a str,
+}
 
+impl<'a> From<&ServeDeliverContext<'a>> for ServeQueueContext<'a> {
+    fn from(context: &ServeDeliverContext<'a>) -> Self {
+        Self {
+            config: context.config,
+            sender_oracle: context.sender_oracle,
+            log_from: context.log_from,
+            log_to: context.log_to,
+            requested: context.requested,
+            resolved: context.resolved,
+            message: context.message,
+            response_text: context.response_text,
+        }
+    }
+}
 
+enum ServeQueueIdempotency {
+    Unclaimed,
+    Claimed(Option<DeliveryIdempotencyKey>),
+}
 
+struct ServeDeliveryFailure<'a> {
+    status: StatusCode,
+    error: &'a str,
+    target: &'a str,
+    detail: &'a str,
+    reason: &'a str,
+}
 
+fn serve_queue_or_fail(
+    state: &ServeState,
+    headers: &HeaderMap,
+    context: &ServeQueueContext<'_>,
+    idempotency: ServeQueueIdempotency,
+    failure: &ServeDeliveryFailure<'_>,
+) -> axum::response::Response {
+    let idempotency_key = match serve_queue_idempotency_claim(state, headers, context, idempotency) {
+        Ok(key) => key,
+        Err(response) => return *response,
+    };
+    if let Ok(response) =
+        serve_write_receiver_inbox(state, headers, context, failure.reason, idempotency_key.as_ref())
+    {
+        return response;
+    }
+    if let Some(key) = idempotency_key.as_ref() {
+        serve_delivery_idempotency_cancel(state, key);
+    }
+    serve_delivery_error(failure.status, failure.error, failure.target, failure.detail)
+}
 
+fn serve_queue_idempotency_claim(
+    state: &ServeState,
+    headers: &HeaderMap,
+    context: &ServeQueueContext<'_>,
+    idempotency: ServeQueueIdempotency,
+) -> Result<Option<DeliveryIdempotencyKey>, Box<axum::response::Response>> {
+    match idempotency {
+        ServeQueueIdempotency::Claimed(key) => Ok(key),
+        ServeQueueIdempotency::Unclaimed => {
+            // Fallback paths can fail before or after route resolution. The
+            // caller retries the requested target, so that is the stable
+            // idempotency target across route-list, TOCTOU, and tmux-send
+            // failures; using the resolved tmux target would split one logical
+            // delivery into multiple inbox writes.
+            let key = serve_delivery_idempotency_key(
+                headers,
+                context.log_from,
+                context.requested,
+                context.message,
+            );
+            let Some(key) = key else {
+                return Ok(None);
+            };
+            match serve_delivery_idempotency_claim(state, key.clone(), serve_delivery_idempotency_now(state)) {
+                DeliveryIdempotencyClaim::Claimed => Ok(Some(key)),
+                DeliveryIdempotencyClaim::Duplicate(record) => {
+                    serve_log_delivery_deduped(
+                        state,
+                        &key,
+                        context.resolved,
+                        context.message,
+                        context.log_from,
+                        context.log_to,
+                        "inbox",
+                    );
+                    Err(Box::new(serve_delivery_idempotency_response(
+                        &record,
+                        context.resolved,
+                        context.response_text,
+                        "inbox",
+                    )))
+                }
+            }
+        }
+    }
+}
 
+fn serve_write_receiver_inbox(
+    state: &ServeState,
+    headers: &HeaderMap,
+    context: &ServeQueueContext<'_>,
+    reason: &str,
+    idempotency_key: Option<&DeliveryIdempotencyKey>,
+) -> Result<axum::response::Response, String> {
+    let from = serve_display_from(headers, context.config, context.sender_oracle);
+    match state.receiver_inbox.write_receiver_inbox(ReceiverInboxInput {
+        query: context.requested,
+        target: Some(context.resolved),
+        to: Some(context.requested),
+        from: &from,
+        message: context.message,
+        config: context.config,
+    }) {
+        ReceiverInboxResult::Ok(inbox) => {
+            if let Some(key) = idempotency_key {
+                serve_delivery_idempotency_complete(
+                    state,
+                    key.clone(),
+                    context.resolved,
+                    "queued",
+                    serve_delivery_idempotency_now(state),
+                );
+            }
+            serve_log_lifecycle(
+                state,
+                json!({
+                    "kind": "context.message",
+                    "direction": "inbound",
+                    "state": "queued",
+                    "route": "inbox",
+                    "from": serve_truncate(&from, SERVE_LOG_TEXT_MAX),
+                    "to": serve_truncate(context.log_to, SERVE_LOG_TEXT_MAX),
+                    "target": context.resolved,
+                    "requestedTarget": context.requested,
+                    "text": serve_truncate(context.message, SERVE_LOG_TEXT_MAX),
+                    "oracle": inbox.oracle,
+                    "lastLine": reason,
+                    "signed": !header_to_string(headers, "x-maw-from").trim().is_empty(),
+                    "source": "maw-rs-native",
+                }),
+            );
+            Ok(Json(json!({
+                "ok": true,
+                "target": context.resolved,
+                "text": context.response_text,
+                "source": "inbox",
+                "state": "queued",
+                "inbox": inbox.path.display().to_string(),
+                "reason": reason,
+                "receipt": ["fallback_queued"],
+            }))
+            .into_response())
+        }
+        ReceiverInboxResult::Err { oracle: _, reason } => Err(reason),
+    }
+}
 
-fn serve_deliver_local(
+enum ServeLocalPreflight {
+    Ready(Option<DeliveryIdempotencyKey>),
+    Response(Box<axum::response::Response>),
+}
+
+fn serve_deliver_local_preflight(
     state: &ServeState,
     context: &ServeDeliverContext<'_>,
-) -> axum::response::Response {
+) -> ServeLocalPreflight {
     let fresh_sessions = match state.delivery.route_sessions() {
         Ok(sessions) => sessions,
         Err(error) => {
             serve_log_delivery_failed(state, context.requested, context.message, context.log_from, context.log_to, &error, "toctou-list");
-            return serve_delivery_error(StatusCode::SERVICE_UNAVAILABLE, "route-list-failed", context.requested, &error);
+            return ServeLocalPreflight::Response(Box::new(serve_queue_or_fail(
+                state,
+                context.headers,
+                &ServeQueueContext::from(context),
+                ServeQueueIdempotency::Unclaimed,
+                &ServeDeliveryFailure {
+                    status: StatusCode::SERVICE_UNAVAILABLE,
+                    error: "route-list-failed",
+                    target: context.requested,
+                    detail: &error,
+                    reason: &format!("tmux unavailable: {error}"),
+                },
+            )));
         }
     };
     if !serve_resolved_target_exists(&fresh_sessions, context.resolved) {
         let error = format!("target disappeared before delivery: {}", context.resolved);
         serve_log_delivery_failed(state, context.requested, context.message, context.log_from, context.log_to, &error, "toctou");
-        return serve_delivery_error(StatusCode::NOT_FOUND, "target-disappeared", context.requested, &error);
+        return ServeLocalPreflight::Response(Box::new(serve_queue_or_fail(
+            state,
+            context.headers,
+            &ServeQueueContext::from(context),
+            ServeQueueIdempotency::Unclaimed,
+            &ServeDeliveryFailure {
+                status: StatusCode::NOT_FOUND,
+                error: "target-disappeared",
+                target: context.requested,
+                detail: &error,
+                reason: &error,
+            },
+        )));
     }
 
     let idempotency_key = context.idempotency_key.clone();
@@ -881,17 +1312,27 @@ fn serve_deliver_local(
                     context.log_to,
                     "local",
                 );
-                return serve_delivery_idempotency_response(
+                return ServeLocalPreflight::Response(Box::new(serve_delivery_idempotency_response(
                     &record,
                     context.resolved,
                     context.message,
                     "maw-rs",
-                );
+                )));
             }
             DeliveryIdempotencyClaim::Claimed => {}
         }
     }
+    ServeLocalPreflight::Ready(idempotency_key)
+}
 
+fn serve_deliver_local(
+    state: &ServeState,
+    context: &ServeDeliverContext<'_>,
+) -> axum::response::Response {
+    let idempotency_key = match serve_deliver_local_preflight(state, context) {
+        ServeLocalPreflight::Ready(key) => key,
+        ServeLocalPreflight::Response(response) => return *response,
+    };
     let outbound = format_local_hey_message(
         context.message,
         context.config,
@@ -899,14 +1340,32 @@ fn serve_deliver_local(
         context.from,
     );
     if let Err(error) = state.delivery.send_literal_enter(context.resolved, &outbound) {
-        if let Some(key) = idempotency_key.as_ref() {
-            serve_delivery_idempotency_cancel(state, key);
-        }
         serve_log_delivery_failed(state, context.requested, context.message, context.log_from, context.log_to, &error, "tmux-send");
-        return serve_delivery_error(StatusCode::BAD_GATEWAY, "tmux-send-failed", context.resolved, &error);
+        return serve_queue_or_fail(
+            state,
+            context.headers,
+            &ServeQueueContext::from(context),
+            ServeQueueIdempotency::Claimed(idempotency_key),
+            &ServeDeliveryFailure {
+                status: StatusCode::BAD_GATEWAY,
+                error: "tmux-send-failed",
+                target: context.resolved,
+                detail: &error,
+                reason: &format!("tmux delivery failed: {error}"),
+            },
+        );
     }
 
     let capture = state.delivery.capture_tail(context.resolved, 8).unwrap_or_default();
+    serve_deliver_local_success(state, context, idempotency_key, &capture)
+}
+
+fn serve_deliver_local_success(
+    state: &ServeState,
+    context: &ServeDeliverContext<'_>,
+    idempotency_key: Option<DeliveryIdempotencyKey>,
+    capture: &str,
+) -> axum::response::Response {
     let state_name = if capture.contains("Press up to edit queued messages") {
         "queued"
     } else {
@@ -921,7 +1380,7 @@ fn serve_deliver_local(
             serve_delivery_idempotency_now(state),
         );
     }
-    let last_line = serve_last_nonempty_line(&capture);
+    let last_line = serve_last_nonempty_line(capture);
     serve_log_lifecycle(
         state,
         json!({
@@ -940,7 +1399,7 @@ fn serve_deliver_local(
         }),
     );
     let non_agent_warning = serve_log_non_agent_pane_warning(state, context.resolved);
-    Json(json!({
+    let mut payload = json!({
         "ok": true,
         "target": context.resolved,
         "text": context.message,
@@ -948,8 +1407,11 @@ fn serve_deliver_local(
         "state": state_name,
         "lastLine": last_line,
         "warning": non_agent_warning,
-    }))
-    .into_response()
+    });
+    if let Some(woke_for) = context.woke_for {
+        payload["wokeFor"] = json!(woke_for);
+    }
+    Json(payload).into_response()
 }
 
 fn serve_delivery_error(
@@ -1256,11 +1718,37 @@ async fn api_wake(
         return response;
     }
     let parsed = serde_json::from_slice::<WakeBody>(&body).unwrap_or_default();
-    let target = parsed.target.unwrap_or_default();
+    let target = parsed
+        .target
+        .filter(|value| !value.trim().is_empty())
+        .or(parsed.oracle)
+        .unwrap_or_default();
     if target.trim().is_empty() {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({"ok": false, "error": "empty-target"})),
+        )
+            .into_response();
+    }
+    // `api-wake` always wakes — that is the endpoint's whole purpose. Routing
+    // through the shared policy anyway keeps the decision auditable next to the
+    // other sites, so a future policy change cannot silently no-op this route
+    // without the refusal showing up here.
+    let decision = should_auto_wake(
+        &target,
+        AutoWakeOptions {
+            site: AutoWakeSite::ApiWake,
+            ..AutoWakeOptions::default()
+        },
+    );
+    if !decision.wake {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "ok": false,
+                "target": target,
+                "error": format!("wake denied: {}", decision.reason),
+            })),
         )
             .into_response();
     }
@@ -1575,6 +2063,10 @@ struct SendBody {
 #[derive(Default, Deserialize)]
 struct WakeBody {
     target: Option<String>,
+    /// Pre-rename spelling still sent by older peers and by maw-ui-lite, which
+    /// posts both keys. maw-js reads `target ?? oracle`; without the alias a
+    /// caller that sends only `oracle` gets a 400 from a route that exists.
+    oracle: Option<String>,
     task: Option<String>,
 }
 

@@ -383,10 +383,15 @@ mod serveidentity_tests {
         let _restore_maw_state = EnvVarRestore::capture("MAW_STATE_DIR");
         let _restore_maw_config = EnvVarRestore::capture("MAW_CONFIG_DIR");
         let _restore_peer = EnvVarRestore::capture("MAW_PEER_KEY");
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
         let root = std::env::temp_dir().join(format!(
-            "maw-rs-serveidentity-{}",
-            current_epoch_seconds()
+            "maw-rs-serveidentity-{}-{unique}",
+            std::process::id()
         ));
+        let _ = std::fs::remove_dir_all(&root);
         let state = root.join("state");
         let config = root.join("config");
         std::fs::create_dir_all(&state).expect("state");
@@ -404,6 +409,8 @@ mod serveidentity_tests {
         std::fs::write(state.join("peer-key"), "pub-from-file\n").expect("peer-key");
         let payload = serveidentity_http_payload_read_only().expect("payload");
         assert_eq!(payload["pubkey"], "pub-from-file");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
