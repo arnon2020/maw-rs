@@ -58,6 +58,24 @@ impl maw_matcher::Named for WakeRepoCandidate {
     fn name(&self) -> &str { &self.name }
 }
 
+/// Whether the local `maw wake <target>` pipeline can resolve one target
+/// without guessing or mutating tmux.
+///
+/// Keep this on the command's parser, picker and resolver path: API auto-wake
+/// must never grow a parallel "known agent" list that accepts typos the command
+/// itself would stop at for confirmation.
+fn wake_target_is_resolvable(target: &str, sessions: &[TmuxSession]) -> bool {
+    let argv = vec![target.to_owned(), "--no-attach".to_owned()];
+    let Ok(options) = wake_parse_args(&argv) else { return false; };
+    if options.target != target {
+        return false;
+    }
+    if wake_picker_rows(&options, sessions).is_some() {
+        return false;
+    }
+    wake_resolve(&options, sessions).is_ok_and(|resolved| resolved.repo_fuzzy_match.is_none())
+}
+
 fn wake_oracle(options: &WakeOptionsNative) -> Result<String, String> {
     let slug = workon_github_slug(&options.target);
     let raw = options

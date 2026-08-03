@@ -411,6 +411,22 @@ mod serve_tests {
         fleet: Arc<dyn ServeFleetRegistry>,
         receiver_inbox: Arc<dyn ServeReceiverInbox>,
     ) -> Router {
+        serve_test_app_with_wake_fleet_inbox_and_woken_target(
+            trust_store_path,
+            wake,
+            fleet,
+            receiver_inbox,
+            "atlas",
+        )
+    }
+
+    fn serve_test_app_with_wake_fleet_inbox_and_woken_target(
+        trust_store_path: std::path::PathBuf,
+        wake: Arc<dyn ServeWakeExecutor>,
+        fleet: Arc<dyn ServeFleetRegistry>,
+        receiver_inbox: Arc<dyn ServeReceiverInbox>,
+        woken_target: &str,
+    ) -> Router {
         let delivery = Arc::new(FakeServeDelivery::with_capture_agent());
         delivery.set_sessions(vec![
             vec![
@@ -420,7 +436,7 @@ mod serve_tests {
             vec![
                 serve_test_session("capture-agent", 0, "capture-agent"),
                 serve_test_session("remote-oracle", 0, "remote-oracle"),
-                serve_test_session("atlas", 0, "atlas"),
+                serve_test_session(woken_target, 0, woken_target),
             ],
         ]);
         serve_router(ServeState {
@@ -774,6 +790,40 @@ mod serve_tests {
     }
 
     #[tokio::test]
+    async fn serve_send_wakes_repo_resolvable_agent_instead_of_silently_queueing() {
+        let env = ServeInboxManifestEnv::new("wake-before-queue");
+        let repo = env.ghq.join("github.com/acme/cipher-oracle");
+        std::fs::create_dir_all(&repo).expect("wakeable agent repo");
+        std::fs::write(
+            env.config.join("maw.config.json"),
+            r#"{"node":"local","agents":{"cipher":"local"}}"#,
+        )
+        .expect("config with local agent");
+
+        let wake = Arc::new(FakeServeWake::default());
+        let app = serve_test_app_with_wake_fleet_inbox_and_woken_target(
+            serve_test_trust_store_path("send-wake-before-queue"),
+            wake.clone(),
+            Arc::new(ServeSystemFleetRegistry),
+            serve_test_receiver_inbox_at(&repo, 1_782_277_200_000),
+            "cipher",
+        );
+        let body = r#"{"target":"cipher","text":"wake me; do not silently queue"}"#;
+        let response = app
+            .oneshot(signed_api_send_json_request(body, KEY, FROM, 1_782_277_200))
+            .await
+            .expect("response");
+        let status = response.status();
+        let payload = response_json(response).await;
+
+        assert_eq!(status, StatusCode::OK, "{payload}");
+        assert_eq!(payload["state"], "delivered", "wakeable cipher must not fall back to queued");
+        assert_eq!(payload["wokeFor"], "cipher");
+        assert_eq!(wake.wakes(), vec![("cipher".to_owned(), None)]);
+        assert!(!repo.join("ψ/inbox").exists(), "successful auto-wake must not leave a masked inbox task");
+    }
+
+    #[tokio::test]
     async fn serve_send_keeps_unknown_target_unwoken_and_not_found() {
         let wake = Arc::new(FakeServeWake::default());
         let app = serve_test_app_with_wake_and_fleet(
@@ -960,6 +1010,59 @@ mod serve_tests {
             error.contains("repo not found for no-such-target-533"),
             "expected real single-positional resolution failure for the target: {error}"
         );
+    }
+
+    #[test]
+    fn serve_system_fleet_registry_knows_wakeable_agent_absent_from_fleet_files() {
+        let _guard = env_test_lock();
+        let _home = EnvVarRestore::capture("HOME");
+        let _xdg = EnvVarRestore::capture("XDG_CONFIG_HOME");
+        let _config = EnvVarRestore::capture("MAW_CONFIG_DIR");
+        let _maw_home = EnvVarRestore::capture("MAW_HOME");
+        let _state = EnvVarRestore::capture("MAW_STATE_DIR");
+        let _ghq = EnvVarRestore::capture("GHQ_ROOT");
+        let root = std::env::temp_dir().join(format!(
+            "maw-rs-serve-wakeable-agent-{}-{}",
+            std::process::id(),
+            random_hex(4)
+        ));
+        std::fs::create_dir_all(root.join("config/fleet")).expect("fleet dir");
+        std::fs::create_dir_all(root.join("ghq/github.com/acme/mason-oracle"))
+            .expect("wakeable agent repo");
+        std::fs::write(
+            root.join("config/maw.config.json"),
+            r#"{"node":"local","agents":{"drift":"local","mason":"local"}}"#,
+        )
+        .expect("config with local agent");
+        std::env::set_var("HOME", root.join("home"));
+        std::env::set_var("XDG_CONFIG_HOME", root.join("xdg-config"));
+        std::env::set_var("MAW_CONFIG_DIR", root.join("config"));
+        std::env::remove_var("MAW_HOME");
+        std::env::set_var("MAW_STATE_DIR", root.join("state"));
+        std::env::set_var("GHQ_ROOT", root.join("ghq/github.com"));
+
+        assert!(fleet_load_entries().is_empty(), "control: mason must not come from a fleet file");
+        let wake = run_wake_command(&[
+            "mason".to_owned(),
+            "--no-attach".to_owned(),
+            "--dry-run".to_owned(),
+        ]);
+        assert_eq!(wake.code, 0, "{}{}", wake.stdout, wake.stderr);
+        assert!(
+            wake.stdout.contains("would wake window 'mason-oracle'"),
+            "control: maw wake must resolve mason: {}",
+            wake.stdout
+        );
+
+        assert!(ServeSystemFleetRegistry.fleet_known("mason"));
+        assert!(
+            !ServeSystemFleetRegistry.fleet_known("drift"),
+            "config membership alone must not outrun maw wake resolution"
+        );
+        assert!(!ServeSystemFleetRegistry.fleet_known("atals"));
+        assert!(!ServeSystemFleetRegistry.fleet_known("zzz-nope"));
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
@@ -1484,6 +1587,7 @@ mod serve_tests {
                 "MAW_HOME",
                 "MAW_CONFIG_DIR",
                 "MAW_CACHE_DIR",
+                "MAW_STATE_DIR",
                 "MAW_XDG",
                 "XDG_CONFIG_HOME",
                 "GHQ_ROOT",
@@ -1510,6 +1614,7 @@ mod serve_tests {
             std::env::remove_var("XDG_CONFIG_HOME");
             std::env::set_var("MAW_CONFIG_DIR", &config);
             std::env::set_var("MAW_CACHE_DIR", &cache);
+            std::env::set_var("MAW_STATE_DIR", root.join("state"));
             std::env::set_var("GHQ_ROOT", ghq.join("github.com"));
             Self {
                 _guard: guard,
