@@ -17,7 +17,14 @@ const AGENTSTATUS_BUSY_HEARTBEAT_MS: u64 = 30_000;
 const AGENTSTATUS_REAL_FEED_TTL_MS: u64 = 60_000;
 const AGENTSTATUS_FEED_HISTORY_MAX_AGE_MS: u64 = 60_000;
 const AGENTSTATUS_REAL_FEED_PRUNE_MS: u64 = 3_600_000;
-const AGENTSTATUS_FEED_CAP: usize = 100;
+/// Matches maw-js `limits.feedMax`. The buffer is shared by status events and
+/// chat messages, so a small cap silently evicts conversation history.
+const AGENTSTATUS_FEED_CAP: usize = 500;
+/// maw-js `limits.feedDefault` / the hard ceiling in `feed.ts`.
+const AGENTSTATUS_FEED_DEFAULT_LIMIT: usize = 50;
+const AGENTSTATUS_FEED_LIMIT_MAX: usize = 200;
+/// maw-js counts an oracle active if it emitted within the last 5 minutes.
+const AGENTSTATUS_FEED_ACTIVE_WINDOW_MS: u64 = 5 * 60_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AgentStatusKind {
@@ -86,7 +93,11 @@ struct AgentStatusWindow {
     name: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+/// Public federation feed event, v1 — the shape maw-js `src/api/feed.ts`
+/// serves and that maw-rs peers already POST to each other
+/// (`http_federation_transport.rs`). Lens clients filter on `event`, so the
+/// field names and the ISO-8601 `timestamp` are load-bearing.
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub(crate) struct AgentStatusFeedEvent {
     timestamp: String,
     oracle: String,
@@ -97,15 +108,21 @@ pub(crate) struct AgentStatusFeedEvent {
     session_id: String,
     message: String,
     ts: u64,
+    /// Structured message-lifecycle payload `{id, from, to, text}`. Absent for
+    /// status events and for client posts that did not send one — chat clients
+    /// dedupe on `id ?? ts|from|to|msg`, so inventing an id here would make a
+    /// message the human just sent render twice.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data: Option<Value>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 struct AgentStatusFeedEntry {
     seq: u64,
     event: AgentStatusFeedEvent,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct AgentStatusFeedRing {
     next_seq: u64,
     entries: VecDeque<AgentStatusFeedEntry>,
@@ -145,6 +162,11 @@ impl AgentStatusFeedRing {
 
     pub(crate) fn agentstatus_cursor(&self) -> u64 {
         self.next_seq
+    }
+
+    /// Oldest-first view of the whole buffer, for `GET /api/feed`.
+    fn agentstatus_all(&self) -> Vec<&AgentStatusFeedEvent> {
+        self.entries.iter().map(|entry| &entry.event).collect()
     }
 
     pub(crate) fn agentstatus_drain_after(&self, cursor: u64) -> (Vec<AgentStatusFeedEvent>, u64) {
@@ -281,6 +303,108 @@ pub(crate) fn agentstatus_drain_feed(cursor: u64) -> (Vec<AgentStatusFeedEvent>,
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     global.feed.agentstatus_drain_after(cursor)
+}
+
+/// Reads a maw-js v1 feed payload, applying the same defaults as
+/// `maw-js src/api/feed.ts` POST /feed, and appends it to the shared buffer
+/// that `GET /api/feed` and the `/ws` feed frames both read.
+///
+/// `data` is carried through only when the caller supplied it — see the field
+/// comment on [`AgentStatusFeedEvent::data`].
+pub(crate) fn agentstatus_feed_push_value(payload: &Value) {
+    let now_ms = agentstatus_now_millis();
+    let event = agentstatus_feed_event_from_value(payload, now_ms);
+    let lock = AGENTSTATUS_GLOBAL.get_or_init(|| Mutex::new(AgentStatusGlobal::default()));
+    let mut global = lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    global.feed.agentstatus_push(event);
+}
+
+fn agentstatus_feed_event_from_value(payload: &Value, now_ms: u64) -> AgentStatusFeedEvent {
+    // maw-js uses `b.field || default`, so an empty string also falls back.
+    let text = |key: &str, fallback: &str| -> String {
+        payload
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(fallback)
+            .to_owned()
+    };
+    AgentStatusFeedEvent {
+        timestamp: payload
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map_or_else(|| agentstatus_iso_millis(now_ms), ToOwned::to_owned),
+        oracle: text("oracle", "unknown"),
+        host: text("host", "local"),
+        event: text("event", "Notification"),
+        project: text("project", ""),
+        session_id: text("sessionId", ""),
+        message: text("message", ""),
+        ts: payload
+            .get("ts")
+            .and_then(Value::as_u64)
+            .filter(|ts| *ts != 0)
+            .unwrap_or(now_ms),
+        data: payload.get("data").filter(|data| !data.is_null()).cloned(),
+    }
+}
+
+/// Serves `GET /api/feed`, mirroring `maw-js src/api/feed.ts`.
+///
+/// Order of operations is load-bearing: the event filter runs over the *whole*
+/// buffer before the limit slice, so sparse event types (chat messages) are not
+/// flooded out of the window by frequent status events.
+pub(crate) fn agentstatus_feed_query(
+    limit: Option<usize>,
+    events: Option<&str>,
+    oracle: Option<&str>,
+) -> (Vec<AgentStatusFeedEvent>, Vec<String>) {
+    let now_ms = agentstatus_now_millis();
+    let lock = AGENTSTATUS_GLOBAL.get_or_init(|| Mutex::new(AgentStatusGlobal::default()));
+    let global = lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let buffer = global.feed.agentstatus_all();
+
+    let limit = limit
+        .filter(|value| *value > 0)
+        .unwrap_or(AGENTSTATUS_FEED_DEFAULT_LIMIT)
+        .min(AGENTSTATUS_FEED_LIMIT_MAX);
+    let wanted = events.map(|raw| {
+        raw.split(',')
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .collect::<BTreeSet<_>>()
+    });
+    let pool = buffer
+        .iter()
+        .filter(|event| {
+            wanted
+                .as_ref()
+                .is_none_or(|wanted| wanted.contains(event.event.as_str()))
+        })
+        .copied()
+        .collect::<Vec<_>>();
+    let start = pool.len().saturating_sub(limit);
+    let mut selected = pool[start..]
+        .iter()
+        .filter(|event| oracle.is_none_or(|oracle| event.oracle == oracle))
+        .map(|event| (*event).clone())
+        .collect::<Vec<_>>();
+    // Clients render oldest-first but expect the wire order newest-first.
+    selected.reverse();
+
+    let cutoff = now_ms.saturating_sub(AGENTSTATUS_FEED_ACTIVE_WINDOW_MS);
+    let mut active_oracles = Vec::<String>::new();
+    for event in &buffer {
+        if event.ts >= cutoff && !active_oracles.iter().any(|name| *name == event.oracle) {
+            active_oracles.push(event.oracle.clone());
+        }
+    }
+    (selected, active_oracles)
 }
 
 pub(crate) fn agentstatus_mark_real_feed_event(oracle: &str) {
@@ -643,6 +767,7 @@ fn agentstatus_feed_event(
         session_id: String::new(),
         message: status.agentstatus_message().to_owned(),
         ts: now_ms,
+        data: None,
     }
 }
 

@@ -629,15 +629,12 @@ async fn api_feed_get(
     State(state): State<Arc<ServeState>>,
     Query(query): Query<FeedQuery>,
 ) -> impl IntoResponse {
-    let events = serve_feed_snapshot(&state, query.limit);
-    let mut active_oracles = Vec::<String>::new();
-    for event in &events {
-        if let Some(oracle) = event.get("oracle").and_then(Value::as_str) {
-            if !active_oracles.iter().any(|item| item == oracle) {
-                active_oracles.push(oracle.to_owned());
-            }
-        }
-    }
+    let _ = &state;
+    let (events, active_oracles) = crate::serve_core::modules::agent_status::agentstatus_feed_query(
+        query.limit,
+        query.event.as_deref(),
+        query.oracle.as_deref(),
+    );
     Json(json!({"events": events, "total": events.len(), "active_oracles": active_oracles}))
 }
 
@@ -1413,12 +1410,74 @@ fn serve_log_delivery_failed(
 }
 
 fn serve_log_lifecycle(state: &ServeState, event: Value) {
+    serve_push_public_feed_event(&event);
     match state.feed.lock() {
         Ok(mut feed) => serve_push_feed_event(&mut feed, event),
         Err(poisoned) => {
             let mut feed = poisoned.into_inner();
             serve_push_feed_event(&mut feed, event);
         }
+    }
+}
+
+/// Mirrors a delivery record into the public v1 feed (`GET /api/feed`, `/ws`)
+/// as a message-lifecycle event, so agent-to-agent traffic reaches chat
+/// clients. Without this the feed carries only status events and every chat
+/// view renders empty.
+///
+/// The recipient is encoded in `message` as maw-js's `"<recipient>: <text>"`
+/// rather than in a structured `data` payload, because clients only trust
+/// `data` once it carries a lifecycle `id` — and a per-record id fabricated
+/// here would render one message twice when a delivery logs both `queued` and
+/// `delivered`. The raw record still rides along in `data` for diagnostics; it
+/// has no `id`, so clients fall through to parsing `message`.
+fn serve_push_public_feed_event(record: &Value) {
+    let field = |key: &str| record.get(key).and_then(Value::as_str).unwrap_or_default();
+    let text = field("text");
+    // Warning-only records (e.g. non-agent pane) carry no message body.
+    if text.is_empty() {
+        return;
+    }
+    // A delivery dropped by the idempotency key is the same message again.
+    if field("state") == "deduped" {
+        return;
+    }
+    let recipient = serve_feed_identity(field("oracle"));
+    if recipient == "unknown" {
+        return;
+    }
+    let sender = serve_feed_identity(if record.get("context.from").is_some() {
+        field("context.from")
+    } else {
+        field("from")
+    });
+    // maw-js reserves MessageDeliver for the inbound half of a cross-host
+    // conversation; everything local is a MessageSend.
+    let event = if field("route").contains("peer") {
+        "MessageDeliver"
+    } else {
+        "MessageSend"
+    };
+    crate::serve_core::modules::agent_status::agentstatus_feed_push_value(&json!({
+        "oracle": sender,
+        "host": "local",
+        "event": event,
+        "project": field("route"),
+        "message": format!("{recipient}: {text}"),
+        "data": record,
+    }));
+}
+
+/// `"local:tars"` / `"local:pane/unknown"` / `"tars@white"` -> `"tars"` /
+/// `"unknown"` — chat clients match on the bare oracle name.
+fn serve_feed_identity(raw: &str) -> String {
+    let name = raw.split_once(':').map_or(raw, |(_, rest)| rest);
+    let name = name.rsplit('/').next().unwrap_or(name);
+    let name = name.split('@').next().unwrap_or(name).trim();
+    if name.is_empty() {
+        "unknown".to_owned()
+    } else {
+        name.to_ascii_lowercase()
     }
 }
 
@@ -1563,6 +1622,14 @@ async fn api_feed_post(
             crate::serve_core::modules::agent_status::agentstatus_oracle_from_feed_payload(&body)
         {
             crate::serve_core::modules::agent_status::agentstatus_mark_real_feed_event(&oracle);
+        }
+        // Persist the post, or the event is a black hole: chat composers and
+        // federation peers both POST here and then expect GET /api/feed and the
+        // /ws feed frames to replay what they sent.
+        if let Ok(payload) = serde_json::from_slice::<Value>(&body) {
+            if payload.is_object() {
+                crate::serve_core::modules::agent_status::agentstatus_feed_push_value(&payload);
+            }
         }
         Json(json!({"ok": true})).into_response()
     }
@@ -2025,6 +2092,11 @@ struct WakeBody {
 #[derive(Default, Deserialize)]
 struct FeedQuery {
     limit: Option<usize>,
+    /// Comma-separated event-type allowlist, e.g. `?event=MessageSend,MessageDeliver`.
+    /// Chat clients rely on it to keep conversation history from being flooded
+    /// out of the window by status events.
+    event: Option<String>,
+    oracle: Option<String>,
 }
 
 #[derive(Default)]
