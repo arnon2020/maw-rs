@@ -14,13 +14,17 @@
 /// duplicate rather than reaching into `serve_core::modules::agent_routes`,
 /// since the two call sites (this file and the `/api/agents` listing) sit in
 /// different module trees.
-fn serve_pane_looks_like_agent(command: &str, title: &str) -> bool {
+fn serve_pane_looks_like_agent(command: &str, title: &str, window_name: &str) -> bool {
     let command_lower = command.to_ascii_lowercase();
     let title_lower = title.to_ascii_lowercase();
+    let window_lower = window_name.to_ascii_lowercase();
     title_lower.contains("agent")
         || title_lower.contains("oracle")
         || title_lower.contains("codex")
         || title_lower.contains("claude")
+        || window_lower.contains("oracle")
+        || window_lower.contains("codex")
+        || window_lower.contains("claude")
         || command_lower.contains("codex")
         || command_lower.contains("claude")
         || serve_command_is_versioned_binary(command)
@@ -99,7 +103,7 @@ fn serve_non_agent_pane_warning_from_panes(
     let (session_name, _) = resolved.split_once(':')?;
     let window_name = serve_window_name_for_resolved_target(sessions, resolved)?;
     let pane = serve_pane_for_resolved_target(panes, session_name, &window_name)?;
-    if serve_pane_looks_like_agent(&pane.command, &pane.title) {
+    if serve_pane_looks_like_agent(&pane.command, &pane.title, &window_name) {
         return None;
     }
     Some(format!(

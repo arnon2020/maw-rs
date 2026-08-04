@@ -451,13 +451,16 @@ fn send_local_message_with_audit(
     };
     let display_from = send_display_from(from);
     let outbound = format_local_hey_message(text, config, sender_oracle, display_from.as_deref());
-    if let Err(error) = tmux.send_text(target, &outbound) {
-        return CliOutput {
-            code: 1,
-            stdout: String::new(),
-            stderr: format!("{command}: tmux send-text failed: {error}\n"),
-        };
-    }
+    let send_report = match tmux.send_text(target, &outbound) {
+        Ok(report) => report,
+        Err(error) => {
+            return CliOutput {
+                code: 1,
+                stdout: String::new(),
+                stderr: format!("{command}: tmux send-text failed: {error}\n"),
+            };
+        }
+    };
     send_record_success(command, audit_args, config, sender_oracle, from, query, &outbound, "local", signature.as_ref());
     send_emit_message_lifecycle_feed(&SendMessageLifecycleFeedInput {
         id: feed_id,
@@ -473,16 +476,37 @@ fn send_local_message_with_audit(
         last_line: None,
         signed: true,
     });
+    let pending_warning = send_pending_input_warning(target, &send_report);
+    if let Some(warning) = pending_warning.as_deref() {
+        send_emit_message_lifecycle_feed(&SendMessageLifecycleFeedInput {
+            id: feed_id,
+            ts: cli_dispatch_now_iso(),
+            direction: "outbound",
+            state: "delivered-pending-input",
+            channel: command,
+            route: "local",
+            from: send_normalized_from(config, sender_oracle, from).as_deref().unwrap_or("local:unknown"),
+            to: query,
+            target: Some(target),
+            text: &outbound,
+            last_line: Some(warning),
+            signed: true,
+        });
+    }
     // #709: `delivered` must not stay silent when the resolved pane isn't
     // agent-shaped (window rename, pane replaced, agent closed) -- warn
     // rather than let a shell-prompt delivery look identical to a real one.
-    let warning = serve_non_agent_pane_warning(target)
-        .map(|warning| format!("\x1b[33mwarning: {warning}\x1b[0m\n"))
-        .unwrap_or_default();
+    let mut stderr = String::new();
+    if let Some(warning) = pending_warning {
+        stderr.push_str(&send_warning_line(&warning));
+    }
+    if let Some(warning) = serve_non_agent_pane_warning(target) {
+        stderr.push_str(&send_warning_line(&warning));
+    }
     CliOutput {
         code: 0,
         stdout: send_success_output(command, target, &outbound),
-        stderr: warning,
+        stderr,
     }
 }
 
@@ -560,6 +584,22 @@ fn send_local_inbox_only_with(
 
 fn send_success_output(command: &str, target: &str, outbound: &str) -> String {
     if command == "hey" { format!("delivered → {target}: {outbound}\n") } else { format!("delivered {target}\n") }
+}
+
+fn send_pending_input_warning(
+    target: &str,
+    report: &maw_tmux::SendTextReport,
+) -> Option<String> {
+    report.warned_pending.then(|| {
+        format!(
+            "delivered to {target}, but the pane may still have unsubmitted input after {} Enter attempt(s); run `maw send-enter {target}` to submit it manually",
+            report.enter_attempts
+        )
+    })
+}
+
+fn send_warning_line(warning: &str) -> String {
+    format!("\x1b[33mwarning: {warning}\x1b[0m\n")
 }
 
 struct SendMessageLifecycleFeedInput<'a> {
@@ -890,7 +930,6 @@ fn send_record_success(
         sink.record(&record);
     }
 }
-
 
 
 

@@ -73,11 +73,7 @@ impl TeamEnterTmux240 {
         let Some(pending) = self.team_pending_input(pane_id) else {
             return maw_tmux::PendingInputState::Cleared;
         };
-        if maw_tmux::pending_input_matches_sent(&pending, text) {
-            maw_tmux::PendingInputState::MatchesSent
-        } else {
-            maw_tmux::PendingInputState::DifferentInput
-        }
+        team_pending_input_to_state240(&pending, text)
     }
 
     fn team_pending_input(&mut self, pane_id: &str) -> Option<String> {
@@ -131,6 +127,14 @@ impl TeamEnterTmux240 {
             return Ok(String::new());
         }
         maw_tmux::TmuxRunner::run(&mut self.runner, command, args).map_err(|error| error.message)
+    }
+}
+
+fn team_pending_input_to_state240(pending: &str, text: &str) -> maw_tmux::PendingInputState {
+    if maw_tmux::pending_input_matches_sent(pending, text) {
+        maw_tmux::PendingInputState::MatchesSent
+    } else {
+        maw_tmux::PendingInputState::DifferentInput
     }
 }
 
@@ -258,6 +262,25 @@ mod team_enter_tests240 {
         assert!(team_enter_parse240(&team_enter_strings240(&["enter", "-bad"])).expect_err("dash").contains("leading dash"));
         assert!(team_enter_parse240(&team_enter_strings240(&["send-enter", "builder", "-bad"])).expect_err("dash").contains("team text"));
         assert!(team_validate_pane_id240("pane").expect_err("pane").contains("expected tmux pane id"));
+    }
+
+    #[test]
+    fn team_enter_rejects_fake_pasted_content_placeholders() {
+        assert_eq!(
+            team_pending_input_to_state240("[Pasted Content +1 chars]", "long pasted work order"),
+            maw_tmux::PendingInputState::DifferentInput
+        );
+        assert_eq!(
+            team_pending_input_to_state240("[Pasted Content 0001 chars]", "long pasted work order"),
+            maw_tmux::PendingInputState::DifferentInput
+        );
+        assert_eq!(
+            team_pending_input_to_state240(
+                "[Pasted Content 2032 chars][Pasted Content 1022 chars]",
+                "long pasted work order",
+            ),
+            maw_tmux::PendingInputState::MatchesSent
+        );
     }
 
     fn team_enter_strings240(args: &[&str]) -> Vec<String> { args.iter().map(|arg| (*arg).to_owned()).collect() }

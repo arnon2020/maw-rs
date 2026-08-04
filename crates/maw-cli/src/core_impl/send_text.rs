@@ -461,6 +461,34 @@ mod sendtext_tests {
     }
 
     #[test]
+    fn sendtext_does_not_retry_fake_pasted_content_placeholder() {
+        let _lock = super::env_test_lock();
+        let _env = SendtextEnvGuard::sendtext_new();
+        let long_text = "dispatch this work order\n".repeat(150);
+        let mut tmux = SendtextMockTmux::sendtext_with_responses(vec![
+            Ok("0"),
+            Ok(""),
+            Ok(""),
+            Ok(""),
+            Ok("$ [Pasted Content 0 chars]"),
+            Ok("$ [Pasted Content 1 chars]\t[Pasted Content 2 chars]"),
+        ]);
+
+        let output =
+            sendtext_with_no_sleep(&[String::from("%9"), long_text], &mut tmux).expect("send");
+
+        assert!(output.stdout.contains("pending input after Enter retries"));
+        assert_eq!(
+            tmux.calls
+                .iter()
+                .filter(|(command, args)| command == "send-keys"
+                    && args.last().is_some_and(|arg| arg == "Enter"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn sendtext_grace_recheck_catches_false_negative_before_success() {
         let _lock = super::env_test_lock();
         let _env = SendtextEnvGuard::sendtext_new();

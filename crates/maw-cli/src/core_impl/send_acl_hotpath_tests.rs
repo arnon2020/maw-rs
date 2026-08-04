@@ -222,6 +222,48 @@ mod send_acl_hotpath_tests {
         assert_eq!(delivered["data"]["id"], serde_json::json!(id));
     }
 
+    #[test]
+    fn hey_pending_input_report_surfaces_warning_and_lifecycle_state() {
+        let report = maw_tmux::SendTextReport {
+            used_buffer: true,
+            enter_attempts: 4,
+            warned_pending: true,
+        };
+        let warning = send_pending_input_warning("team:1", &report).expect("warning");
+        assert!(warning.contains("unsubmitted input"), "{warning}");
+        assert!(warning.contains("maw send-enter team:1"), "{warning}");
+
+        let line = send_warning_line(&warning);
+        assert!(line.contains("\x1b[33mwarning:"), "{line}");
+
+        let event = send_build_message_lifecycle_feed_event(&SendMessageLifecycleFeedInput {
+            id: "msg-pending",
+            ts: "2026-06-24T03:00:02.000Z".to_owned(),
+            direction: "outbound",
+            state: "delivered-pending-input",
+            channel: "hey",
+            route: "local",
+            from: "m5:atlas",
+            to: "local:bob",
+            target: Some("team:1"),
+            text: "[m5:atlas] long dispatch",
+            last_line: Some(&warning),
+            signed: true,
+        });
+
+        assert_eq!(event["event"], serde_json::json!("MessageSend"));
+        assert_eq!(
+            event["message"],
+            serde_json::json!("outbound/delivered-pending-input m5:atlas → local:bob (team:1) [m5:atlas] long dispatch")
+        );
+        assert_eq!(event["data"]["lastLine"], serde_json::json!(warning));
+        assert_eq!(send_pending_input_warning("team:1", &maw_tmux::SendTextReport {
+            used_buffer: false,
+            enter_attempts: 1,
+            warned_pending: false,
+        }), None);
+    }
+
     #[derive(Debug, Default)]
     struct SendFakeTmuxRunner {
         current_session: Option<Result<String, String>>,

@@ -1,3 +1,5 @@
+const PASTED_CONTENT_MAX_CHARS: u64 = 10_000_000;
+
 fn clamp_pty(value: u32, max: u32) -> u32 {
     value.clamp(1, max)
 }
@@ -88,10 +90,38 @@ pub fn pending_input_matches_sent(pending: &str, sent: &str) -> bool {
     if pending == sent {
         return true;
     }
+    if pending_input_is_pasted_content_placeholder(&pending) {
+        return true;
+    }
     sent.lines()
         .map(str::trim)
         .find(|line| !line.is_empty())
         .is_some_and(|first_line| pending == first_line)
+}
+
+fn pending_input_is_pasted_content_placeholder(pending: &str) -> bool {
+    let mut rest = pending.trim();
+    let mut matched = false;
+    while let Some(tail) = rest.strip_prefix("[Pasted Content ") {
+        let Some((chars, after_segment)) = tail.split_once(" chars]") else {
+            return false;
+        };
+        if chars.is_empty()
+            || !chars.bytes().all(|byte| byte.is_ascii_digit())
+            || (chars.len() > 1 && chars.starts_with('0'))
+        {
+            return false;
+        }
+        let Ok(count) = chars.parse::<u64>() else {
+            return false;
+        };
+        if count == 0 || count > PASTED_CONTENT_MAX_CHARS {
+            return false;
+        }
+        matched = true;
+        rest = after_segment;
+    }
+    matched && rest.is_empty()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

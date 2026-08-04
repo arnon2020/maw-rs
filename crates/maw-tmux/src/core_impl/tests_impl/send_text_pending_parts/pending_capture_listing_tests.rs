@@ -125,7 +125,58 @@
             "first line\nsecond line"
         ));
         assert!(pending_input_matches_sent("deploy now", "\u{a0}deploy now\r"));
+        assert!(pending_input_matches_sent(
+            "[Pasted Content 2032 chars][Pasted Content 1022 chars]",
+            "long pasted work order\nwith multiple lines"
+        ));
+        assert!(!pending_input_matches_sent(
+            "[Pasted Content 0 chars]",
+            "long pasted work order"
+        ));
+        assert!(!pending_input_matches_sent(
+            "[Pasted Content +1 chars]",
+            "long pasted work order"
+        ));
+        assert!(!pending_input_matches_sent(
+            "[Pasted Content 0001 chars]",
+            "long pasted work order"
+        ));
+        assert!(!pending_input_matches_sent(
+            "[Pasted Content 10000001 chars]",
+            "long pasted work order"
+        ));
+        assert!(!pending_input_matches_sent(
+            "[Pasted Content 999999999999999999999999999999999999 chars]",
+            "long pasted work order"
+        ));
+        assert!(!pending_input_matches_sent(
+            "[Pasted Content 1 chars] [Pasted Content 2 chars]",
+            "long pasted work order"
+        ));
+        assert!(!pending_input_matches_sent(
+            "[Pasted Content 1 chars]\t[Pasted Content 2 chars]",
+            "long pasted work order"
+        ));
+        assert!(!pending_input_matches_sent(
+            "[Pasted Content chars]",
+            "long pasted work order"
+        ));
+        assert!(!pending_input_matches_sent(
+            "[Pasted Content please submit this",
+            "long pasted work order"
+        ));
+        assert!(!pending_input_matches_sent(
+            "[Pasted Content 1 chars] plus human text",
+            "long pasted work order"
+        ));
         assert!(!pending_input_matches_sent("different queued input", "deploy now"));
+        assert_eq!(
+            pending_input_state_from_capture(
+                "› [Pasted Content 2032 chars][Pasted Content 1022 chars]",
+                "long pasted work order\nwith multiple lines",
+            ),
+            PendingInputState::MatchesSent
+        );
         assert_eq!(
             pending_input_state_from_capture("❯ deploy now", "deploy now"),
             PendingInputState::MatchesSent
