@@ -681,21 +681,23 @@ fn send_emit_feed_fire_and_forget(port: u16, event: &serde_json::Value) {
     let Ok(body) = serde_json::to_string(&event) else {
         return;
     };
-    let _ = std::thread::spawn(move || {
-        let _ = send_post_feed_once(port, &body);
-    });
+    let _ = send_post_feed_once(port, &body);
 }
 
 fn send_post_feed_once(port: u16, body: &str) -> std::io::Result<()> {
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
-    let timeout = std::time::Duration::from_millis(75);
+    let timeout = std::time::Duration::from_millis(150);
     let mut stream = std::net::TcpStream::connect_timeout(&addr, timeout)?;
+    let _ = stream.set_read_timeout(Some(timeout));
     let _ = stream.set_write_timeout(Some(timeout));
     let request = format!(
         "POST /api/feed HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
-    stream.write_all(request.as_bytes())
+    stream.write_all(request.as_bytes())?;
+    let mut response = [0_u8; 1];
+    let _ = std::io::Read::read(&mut stream, &mut response);
+    Ok(())
 }
 
 /// An empty message body must never reach delivery (#695): a caller with no
@@ -888,8 +890,6 @@ fn send_record_success(
         sink.record(&record);
     }
 }
-
-
 
 
 
