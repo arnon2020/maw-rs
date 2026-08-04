@@ -112,6 +112,7 @@ async fn run_send_like_async_with_args(
     if let Some(refusal) = send_route_gate(command, &send_args.target, &send_args.text, &result) {
         return refusal;
     }
+    let feed_id = send_message_feed_id();
     match result {
         RouteResult::Local { target } | RouteResult::SelfNode { target } if send_args.inbox == Some(true) => {
             send_local_inbox_only(
@@ -122,6 +123,7 @@ async fn run_send_like_async_with_args(
                 &config,
                 &sender_oracle,
                 send_args.from.as_deref(),
+                &feed_id,
             )
         }
         RouteResult::Local { target } | RouteResult::SelfNode { target } => send_local_message_with_audit(
@@ -134,6 +136,7 @@ async fn run_send_like_async_with_args(
             &sender_oracle,
             send_args.from.as_deref(),
             &audit_args,
+            &feed_id,
         ),
         RouteResult::Peer {
             peer_url,
@@ -425,7 +428,8 @@ fn send_local_message(
     sender_oracle: &str,
     from: Option<&str>,
 ) -> CliOutput {
-    send_local_message_with_audit(command, tmux, target, target, text, config, sender_oracle, from, &[])
+    let feed_id = send_message_feed_id();
+    send_local_message_with_audit(command, tmux, target, target, text, config, sender_oracle, from, &[], &feed_id)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -439,6 +443,7 @@ fn send_local_message_with_audit(
     sender_oracle: &str,
     from: Option<&str>,
     audit_args: &[String],
+    feed_id: &str,
 ) -> CliOutput {
     let signature = match send_message_signature(config, sender_oracle, from, text) {
         Ok(signature) => signature,
@@ -454,6 +459,20 @@ fn send_local_message_with_audit(
         };
     }
     send_record_success(command, audit_args, config, sender_oracle, from, query, &outbound, "local", signature.as_ref());
+    send_emit_message_lifecycle_feed(&SendMessageLifecycleFeedInput {
+        id: feed_id,
+        ts: cli_dispatch_now_iso(),
+        direction: "outbound",
+        state: "delivered",
+        channel: command,
+        route: "local",
+        from: send_normalized_from(config, sender_oracle, from).as_deref().unwrap_or("local:unknown"),
+        to: query,
+        target: Some(target),
+        text: &outbound,
+        last_line: None,
+        signed: true,
+    });
     // #709: `delivered` must not stay silent when the resolved pane isn't
     // agent-shaped (window rename, pane replaced, agent closed) -- warn
     // rather than let a shell-prompt delivery look identical to a real one.
@@ -482,8 +501,9 @@ fn send_local_inbox_only(
     config: &HeyConfig,
     sender_oracle: &str,
     from: Option<&str>,
+    feed_id: &str,
 ) -> CliOutput {
-    send_local_inbox_only_with(command, query, target, text, config, sender_oracle, from, &locate_find_oracle_repo_path)
+    send_local_inbox_only_with(command, query, target, text, config, sender_oracle, from, &locate_find_oracle_repo_path, feed_id)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -496,6 +516,7 @@ fn send_local_inbox_only_with(
     sender_oracle: &str,
     from: Option<&str>,
     resolve_repo: &dyn Fn(&str) -> Option<String>,
+    feed_id: &str,
 ) -> CliOutput {
     let to = notify_inbox_to(query, target);
     let Some(repo_path) = resolve_repo(&to) else {
@@ -510,17 +531,173 @@ fn send_local_inbox_only_with(
     let display_from = notify_display_from(from, config, sender_oracle);
     let inbox_dir = std::path::Path::new(&repo_path).join("ψ").join("inbox");
     match inbox_write_file(&inbox_dir, &display_from, &to, text, inbox_now_ms()) {
-        Ok(filename) => CliOutput {
-            code: 0,
-            stdout: format!("queued inbox {to} {filename}\n"),
-            stderr: String::new(),
-        },
-        Err(message) => CliOutput { code: 1, stdout: String::new(), stderr: format!("{command}: {message}\n") },
+        Ok(filename) => {
+            send_emit_message_lifecycle_feed(&SendMessageLifecycleFeedInput {
+                id: feed_id,
+                ts: cli_dispatch_now_iso(),
+                direction: "outbound",
+                state: "queued",
+                channel: command,
+                route: "inbox",
+                from: display_from.as_str(),
+                to: query,
+                target: Some(target),
+                text,
+                last_line: Some("--inbox requested; pane injection skipped"),
+                signed: true,
+            });
+            CliOutput {
+                code: 0,
+                stdout: format!("queued inbox {to} {filename}\n"),
+                stderr: String::new(),
+            }
+        }
+        Err(message) => {
+            CliOutput { code: 1, stdout: String::new(), stderr: format!("{command}: {message}\n") }
+        }
     }
 }
 
 fn send_success_output(command: &str, target: &str, outbound: &str) -> String {
     if command == "hey" { format!("delivered → {target}: {outbound}\n") } else { format!("delivered {target}\n") }
+}
+
+struct SendMessageLifecycleFeedInput<'a> {
+    id: &'a str,
+    ts: String,
+    direction: &'a str,
+    state: &'a str,
+    channel: &'a str,
+    route: &'a str,
+    from: &'a str,
+    to: &'a str,
+    target: Option<&'a str>,
+    text: &'a str,
+    last_line: Option<&'a str>,
+    signed: bool,
+}
+
+fn send_message_feed_id() -> String {
+    let mut bytes = [0_u8; 16];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    let mut out = String::from("msg-");
+    for byte in bytes {
+        let _ = write!(&mut out, "{byte:02x}");
+    }
+    out
+}
+
+fn send_emit_message_lifecycle_feed(input: &SendMessageLifecycleFeedInput<'_>) {
+    let event = send_build_message_lifecycle_feed_event(input);
+    let port = load_hey_config_port().unwrap_or(3456);
+    send_emit_feed_fire_and_forget(port, &event);
+}
+
+fn send_build_message_lifecycle_feed_event(input: &SendMessageLifecycleFeedInput<'_>) -> serde_json::Value {
+    let data = send_build_message_lifecycle_data(input);
+    let (host, oracle) = send_parse_message_feed_identity(if input.direction == "inbound" { input.to } else { input.from });
+    let timestamp = input.ts.clone();
+    let ts = send_message_feed_ts_millis(&timestamp);
+    let event = send_message_feed_event_type(input.direction, input.state);
+    let message = send_message_feed_summary(input);
+    serde_json::json!({
+        "timestamp": timestamp,
+        "oracle": oracle,
+        "host": host,
+        "event": event,
+        "project": "",
+        "sessionId": input.target.unwrap_or_default(),
+        "message": message,
+        "ts": ts,
+        "data": data,
+    })
+}
+
+fn send_build_message_lifecycle_data(input: &SendMessageLifecycleFeedInput<'_>) -> serde_json::Value {
+    let mut data = serde_json::json!({
+        "id": input.id,
+        "ts": input.ts,
+        "direction": input.direction,
+        "state": input.state,
+        "channel": input.channel,
+        "route": input.route,
+        "from": input.from,
+        "to": input.to,
+        "text": input.text,
+        "signed": input.signed,
+    });
+    if let Some(target) = input.target {
+        data["target"] = serde_json::json!(target);
+    }
+    if let Some(last_line) = input.last_line {
+        data["lastLine"] = serde_json::json!(last_line);
+    }
+    data
+}
+
+fn send_parse_message_feed_identity(value: &str) -> (String, String) {
+    if let Some((host, oracle)) = value.split_once(':') {
+        if !host.is_empty() && !oracle.is_empty() {
+            return (host.to_owned(), oracle.to_owned());
+        }
+    }
+    ("local".to_owned(), if value.is_empty() { "unknown" } else { value }.to_owned())
+}
+
+fn send_message_feed_event_type(direction: &str, state: &str) -> &'static str {
+    if state == "failed" {
+        "MessageFail"
+    } else if direction == "outbound" {
+        "MessageSend"
+    } else {
+        "MessageDeliver"
+    }
+}
+
+fn send_message_feed_ts_millis(timestamp: &str) -> u64 {
+    let base = inbox_parse_iso_ms(timestamp).unwrap_or_else(cli_dispatch_now_millis);
+    let seconds = timestamp.get(17..19).and_then(|value| value.parse::<u64>().ok()).unwrap_or(0);
+    let millis = timestamp
+        .split_once('.')
+        .and_then(|(_, tail)| tail.get(..tail.len().min(3)))
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+    base.saturating_add(seconds.saturating_mul(1_000)).saturating_add(millis)
+}
+
+fn send_message_feed_summary(input: &SendMessageLifecycleFeedInput<'_>) -> String {
+    let mut parts = vec![
+        format!("{}/{}", input.direction, input.state),
+        format!("{} → {}", input.from, input.to),
+    ];
+    if let Some(target) = input.target {
+        parts.push(format!("({target})"));
+    }
+    parts.push(input.text.chars().take(200).collect());
+    parts.join(" ")
+}
+
+fn send_emit_feed_fire_and_forget(port: u16, event: &serde_json::Value) {
+    let Ok(body) = serde_json::to_string(&event) else {
+        return;
+    };
+    let _ = send_post_feed_once(port, &body);
+}
+
+fn send_post_feed_once(port: u16, body: &str) -> std::io::Result<()> {
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let timeout = std::time::Duration::from_millis(150);
+    let mut stream = std::net::TcpStream::connect_timeout(&addr, timeout)?;
+    let _ = stream.set_read_timeout(Some(timeout));
+    let _ = stream.set_write_timeout(Some(timeout));
+    let request = format!(
+        "POST /api/feed HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(request.as_bytes())?;
+    let mut response = [0_u8; 1];
+    let _ = std::io::Read::read(&mut stream, &mut response);
+    Ok(())
 }
 
 /// An empty message body must never reach delivery (#695): a caller with no
@@ -713,24 +890,6 @@ fn send_record_success(
         sink.record(&record);
     }
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 
