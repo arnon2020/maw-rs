@@ -478,8 +478,10 @@ fn bg_new_session_args(session: &str, command: &str) -> Result<Vec<String>, Stri
     ])
 }
 
+const BG_DONE_SENTINEL_PREFIX: &str = "[done — exit ";
+
 fn bg_holds_open(command: &str) -> String {
-    format!("{command}; rc=$?; printf '\\n[done — exit %d]\\n' \"$rc\"; while :; do read -r _ 2>/dev/null || sleep 3600; done")
+    format!("{command}; rc=$?; printf '\\n{BG_DONE_SENTINEL_PREFIX}%d]\\n' \"$rc\"; while :; do read -r _ 2>/dev/null || sleep 3600; done")
 }
 
 fn bg_session_exists(slug: &str, tmux: &mut impl BgTmux) -> Result<bool, String> {
@@ -520,12 +522,13 @@ fn bg_session_from_line(
     let command = fields.next().unwrap_or_default();
     let slug = bg_session_slug(name).unwrap_or_default();
     bg_validate_ref(&slug)?;
+    let last_line = bg_last_line_of(&slug, tmux).unwrap_or_default();
     Ok(Some(BgSession {
         slug: slug.clone(),
         session: name.to_owned(),
         age_seconds: now().saturating_sub(created),
-        status: bg_status_from_pane_command(command),
-        last_line: bg_last_line_of(&slug, tmux).unwrap_or_default(),
+        status: bg_status_from_pane(command, &last_line),
+        last_line,
     }))
 }
 
@@ -535,13 +538,44 @@ fn bg_list_error_is_empty(result: &BgTmuxResult) -> bool {
         || result.stderr.contains("no current session")
 }
 
+/// Done detection is sentinel-first: the hold-open wrapper prints
+/// `[done — exit <rc>]` when the payload finishes, so the captured last line
+/// is the authoritative signal. Pane command is only a defensive fallback —
+/// a still-running payload like `sleep 900` or `sh ./job.sh` reports the same
+/// `pane_current_command` (`sleep`/`sh`) as the finished hold-open loop (#579).
+fn bg_status_from_pane(command: &str, last_line: &str) -> BgSessionStatus {
+    if bg_is_done_sentinel(last_line) {
+        return BgSessionStatus::Done;
+    }
+    bg_status_from_pane_command(command)
+}
+
+/// Fallback when the sentinel is absent: only a dead pane (empty command)
+/// counts as done; everything else is presumed still running.
 fn bg_status_from_pane_command(command: &str) -> BgSessionStatus {
-    match command.trim().to_ascii_lowercase().as_str() {
-        "" | "read" | "sleep" | "sh" => BgSessionStatus::Done,
-        _ => BgSessionStatus::Running,
+    if command.trim().is_empty() {
+        BgSessionStatus::Done
+    } else {
+        BgSessionStatus::Running
     }
 }
 
+/// Matches the exact `bg_holds_open` printf format, tolerating surrounding
+/// whitespace: `[done — exit <non-negative integer>]`.
+fn bg_is_done_sentinel(last_line: &str) -> bool {
+    last_line
+        .trim()
+        .strip_prefix(BG_DONE_SENTINEL_PREFIX)
+        .and_then(|rest| rest.strip_suffix(']'))
+        .is_some_and(|code| !code.is_empty() && code.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
+/// Last non-empty line of the pane, looking at the visible screen plus a few
+/// history lines. `-E -1` (previous behavior) ends the capture at the last
+/// *history* line — a short-output job has empty history, so the capture came
+/// back blank and the done sentinel was never seen (#579). Omitting `-E`
+/// captures through the bottom of the visible screen, where the sentinel
+/// actually lives until output scrolls.
 fn bg_last_line_of(slug: &str, tmux: &mut impl BgTmux) -> Result<String, String> {
     bg_validate_ref(slug)?;
     let session = bg_session_name(slug);
@@ -552,13 +586,18 @@ fn bg_last_line_of(slug: &str, tmux: &mut impl BgTmux) -> Result<String, String>
         "-t".to_owned(),
         session,
         "-S".to_owned(),
-        "-1".to_owned(),
-        "-E".to_owned(),
-        "-1".to_owned(),
+        "-10".to_owned(),
     ];
     let result = tmux.bg_run("capture-pane", &args)?;
     if result.status == 0 {
-        Ok(result.stdout.trim_end_matches('\n').trim().to_owned())
+        Ok(result
+            .stdout
+            .lines()
+            .rev()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .unwrap_or_default()
+            .to_owned())
     } else {
         Ok(String::new())
     }
@@ -893,6 +932,41 @@ mod bg_tests {
     }
 
     #[test]
+    fn bg_status_running_payload_is_running_even_with_shell_pane_command() {
+        for pane in ["sleep", "sh", "read", "bash", "cargo", "claude"] {
+            assert_eq!(bg_status_from_pane(pane, "still working"), BgSessionStatus::Running, "pane {pane:?}");
+        }
+    }
+
+    #[test]
+    fn bg_status_sentinel_marks_done_regardless_of_pane_command() {
+        for pane in ["read", "sleep", "sh"] {
+            assert_eq!(bg_status_from_pane(pane, "[done — exit 0]"), BgSessionStatus::Done, "pane {pane:?}");
+        }
+        assert_eq!(bg_status_from_pane("sh", "  [done — exit 137]  "), BgSessionStatus::Done);
+    }
+
+    #[test]
+    fn bg_status_empty_pane_command_is_done() {
+        assert_eq!(bg_status_from_pane("", ""), BgSessionStatus::Done);
+        assert_eq!(bg_status_from_pane("  ", "no sentinel here"), BgSessionStatus::Done);
+    }
+
+    #[test]
+    fn bg_status_rejects_near_sentinel_lines() {
+        for line in ["done", "old done", "[done — exit ]", "[done — exit x]", "[done — exit 0", "exit 0]"] {
+            assert_eq!(bg_status_from_pane("sleep", line), BgSessionStatus::Running, "line {line:?}");
+        }
+    }
+
+    #[test]
+    fn bg_holds_open_wrapper_prints_the_matching_done_sentinel() {
+        let wrapper = bg_holds_open("echo hi");
+        assert!(wrapper.contains(BG_DONE_SENTINEL_PREFIX));
+        assert!(bg_is_done_sentinel("[done — exit 0]"));
+    }
+
+    #[test]
     fn bg_spawn_builds_safe_new_session_after_has_session() {
         let mut tmux = BgFakeTmux::bg_with_responses(vec![bg_fail("missing"), bg_ok_empty()]);
         let output = bg_run(&bg_strings(&["cargo", "test", "--name", "cargo-test"]), &mut tmux, bg_now, bg_not_tmux)
@@ -936,8 +1010,40 @@ mod bg_tests {
     }
 
     #[test]
+    fn bg_last_line_skips_trailing_blank_screen_lines_to_find_the_sentinel() {
+        // Live repro (#579 reopen): the sentinel sits in the visible screen with
+        // blank lines below it; the last NON-empty line must win.
+        let mut tmux = BgFakeTmux::bg_with_responses(vec![
+            bg_ok("maw-bg-quick-c3d4\t1699999940\tbash\n"),
+            bg_ok("$ true\n\n[done — exit 0]\n\n\n\n"),
+        ]);
+        let output = bg_run(&bg_strings(&["ls"]), &mut tmux, bg_now, bg_not_tmux).expect("ls");
+        assert!(output.1.contains("quick-c3d4"), "{}", output.1);
+        assert!(output.1.contains("done"), "{}", output.1);
+        let capture = tmux.calls.last().expect("capture call");
+        assert_eq!(capture.subcommand, "capture-pane");
+        // Must include the visible screen: no -E bound, history window via -S -10.
+        assert!(!capture.args.contains(&"-E".to_owned()), "{:?}", capture.args);
+        assert!(capture.args.contains(&"-10".to_owned()), "{:?}", capture.args);
+    }
+
+    #[test]
+    fn bg_empty_capture_keeps_running_status_for_live_pane() {
+        // A blank capture (no sentinel anywhere) must not mark a live pane done.
+        let mut tmux = BgFakeTmux::bg_with_responses(vec![
+            bg_ok("maw-bg-build-a1b2\t1699999940\tcargo\n"),
+            bg_ok("\n\n\n"),
+        ]);
+        let output = bg_run(&bg_strings(&["ls"]), &mut tmux, bg_now, bg_not_tmux).expect("ls");
+        assert!(output.1.contains("running"), "{}", output.1);
+    }
+
+    #[test]
     fn bg_json_list_is_camel_case_like_js() {
-        let mut tmux = BgFakeTmux::bg_with_responses(vec![bg_ok("maw-bg-build-a1b2\t1699999990\tread\n"), bg_ok("tail\n")]);
+        let mut tmux = BgFakeTmux::bg_with_responses(vec![
+            bg_ok("maw-bg-build-a1b2\t1699999990\tread\n"),
+            bg_ok("[done — exit 0]\n"),
+        ]);
         let output = bg_run(&bg_strings(&["list", "--json"]), &mut tmux, bg_now, bg_not_tmux).expect("json");
         assert!(output.1.contains("\"ageSeconds\": 10"));
         assert!(output.1.contains("\"status\": \"done\""));
@@ -975,7 +1081,7 @@ mod bg_tests {
     fn bg_gc_dry_run_does_not_kill() {
         let mut tmux = BgFakeTmux::bg_with_responses(vec![
             bg_ok("maw-bg-old-a111\t1699900000\tsleep\nmaw-bg-new-b222\t1699999990\tcargo\n"),
-            bg_ok("old done\n"),
+            bg_ok("[done — exit 0]\n"),
             bg_ok("new run\n"),
         ]);
         let output = bg_run(&bg_strings(&["gc", "--dry-run", "--older-than", "1h"]), &mut tmux, bg_now, bg_not_tmux)

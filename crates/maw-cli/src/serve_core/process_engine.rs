@@ -24,6 +24,7 @@ const SERVEENGINE_CHILD_TIMEOUT_ENV: &str = "MAW_RS_SERVE_CHILD_TIMEOUT_SECS";
 const SERVEENGINE_FAKE_TMUX_LOG_ENV: &str = "MAW_RS_SERVECORE_FAKE_TMUX_LOG";
 const SERVEENGINE_FAKE_CAPTURE_ENV: &str = "MAW_RS_SERVECORE_FAKE_CAPTURE";
 const SERVEENGINE_PTY_PROGRAM_ENV: &str = "MAW_RS_SERVECORE_PTY_PROGRAM";
+const SERVEENGINE_PTY_TERM: &str = "screen-256color";
 
 #[derive(Debug)]
 pub struct ServecoreNativeEngine;
@@ -128,15 +129,36 @@ pub(crate) fn serveengine_run_with_timeout(
 }
 
 pub(crate) fn serveengine_tmux_capture(target: &str) -> Result<String, String> {
+    serveengine_tmux_capture_lines(target, None)
+}
+
+pub(crate) fn serveengine_tmux_capture_lines(
+    target: &str,
+    lines: Option<u32>,
+) -> Result<String, String> {
     let target = serveengine_ws_validate_target(target)?;
     if let Ok(capture) = std::env::var(SERVEENGINE_FAKE_CAPTURE_ENV) {
-        return Ok(capture);
+        return Ok(serveengine_tail_capture_lines(capture, lines));
     }
     let mut tmux = maw_tmux::TmuxClient::local();
     let sessions = tmux.list_all();
     let resolved = serveengine_resolve_capture_target(&target, &sessions);
-    tmux.capture(&resolved, None)
+    let capture_lines = lines.filter(|line_count| *line_count > 50);
+    tmux.capture(&resolved, capture_lines)
+        .map(|capture| serveengine_tail_capture_lines(capture, lines))
         .map_err(|error| format!("serve-ws: capture failed: {}", error.message))
+}
+
+fn serveengine_tail_capture_lines(capture: String, lines: Option<u32>) -> String {
+    let Some(lines) = lines.filter(|line_count| *line_count <= 50) else {
+        return capture;
+    };
+    let lines = usize::try_from(lines).unwrap_or(usize::MAX);
+    let chunks = capture.split_inclusive('\n').collect::<Vec<_>>();
+    if chunks.len() <= lines {
+        return capture;
+    }
+    chunks[chunks.len() - lines..].concat()
 }
 
 fn serveengine_resolve_capture_target(target: &str, sessions: &[TmuxSession]) -> String {
@@ -463,7 +485,7 @@ fn serveengine_pty_attach(
         .map_err(|error| format!("pty_open_failed: {error}"))?;
     let mut child = pair
         .slave
-        .spawn_command(CommandBuilder::from_argv(serveengine_pty_argv(&target)))
+        .spawn_command(serveengine_pty_command(&target))
         .map_err(|error| format!("pty_spawn_failed: {error}"))?;
     drop(pair.slave);
     let killer = child.clone_killer();
@@ -551,6 +573,14 @@ fn serveengine_pty_argv(target: &str) -> Vec<OsString> {
         .collect()
 }
 
+fn serveengine_pty_command(target: &str) -> CommandBuilder {
+    let mut command = CommandBuilder::from_argv(serveengine_pty_argv(target));
+    // tmux uses screen-256color inside sessions, and it is widely available
+    // across macOS and Linux terminfo databases used by cross-node portals.
+    command.env("TERM", SERVEENGINE_PTY_TERM);
+    command
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -631,6 +661,16 @@ mod tests {
     }
 
     #[test]
+    fn serveengine_pty_command_sets_portable_tmux_term() {
+        let command = serveengine_pty_command("demo:1.0");
+
+        assert_eq!(
+            command.get_env("TERM"),
+            Some(std::ffi::OsStr::new("screen-256color"))
+        );
+    }
+
+    #[test]
     fn serveengine_runner_reaches_marker_with_argv_and_cwd() {
         let root = temp_dir("marker");
         let bin = root.join("maw-marker");
@@ -708,6 +748,24 @@ printf '{{"cwd":"%s","argv":["%s","%s","%s","%s"]}}' "$(pwd)" "$1" "$2" "$3" "$4
         assert!(log.contains(r#""send-keys""#));
         assert!(log.contains(r#""ls""#));
         fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn serveengine_short_capture_lines_match_maw_js_tail_behavior() {
+        let capture = "one\ntwo\nthree\nfour\n".to_owned();
+
+        assert_eq!(
+            serveengine_tail_capture_lines(capture.clone(), Some(2)),
+            "three\nfour\n"
+        );
+        assert_eq!(
+            serveengine_tail_capture_lines(capture.clone(), Some(80)),
+            capture
+        );
+        assert_eq!(
+            serveengine_tail_capture_lines(capture.clone(), None),
+            capture
+        );
     }
 
     #[test]

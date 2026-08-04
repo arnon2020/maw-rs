@@ -3,7 +3,7 @@ const DISPATCH_104: &[DispatcherEntry] = &[
     DispatcherEntry { command: "peer", handler: Handler::Sync(peers_run_command) },
 ];
 
-const PEERS_HELP: &str = "usage: maw peers <add|list|info|probe|probe-all|accept|remove|forget> [...]\n  add       <alias> <url> [--node <name>] [--ssh <target>] [--user <name>] [--allow-unreachable]\n            — register alias (auto-probes /info). Exits non-zero on handshake failure:\n              2=UNKNOWN/BAD_BODY/TLS  3=DNS  4=REFUSED  5=TIMEOUT  6=HTTP_4XX/5XX\n            --ssh sets the SSH config alias/target for cross-node attach; --user overrides SSH user.\n            --allow-unreachable keeps exit 0 even when the probe fails (CI/bootstrap).\n  list      [--discovered] [--all] [--json] [--limit N]\n            — tabular list of all peers. --discovered: LAN candidates from Scout (#1237).\n              --all: include already-paired (default hides). --limit: cap rows (default 50).\n  info      <alias>                         — JSON details for one peer (includes lastError if set)\n  probe     <alias>                         — re-run /info handshake; updates lastSeen / lastError (#565)\n  probe-all [--timeout <ms>] [--allow-unreachable]\n            — probe every peer in parallel; prints liveness table. Exit = worst PROBE_EXIT_CODE (#669).\n  accept    <node|zid-prefix> [--alias X] | --all (#1237)\n            — pair with a Scout-discovered peer. Shortest unambiguous prefix wins.\n              Refuses if pubkey already pins under a different alias (impersonation guard).\n  remove    <alias>                         — remove (idempotent)\n  forget    <alias>                         — clear cached pubkey so next contact re-TOFUs (#804 Step 2)\n\nstorage: maw state peers.json (v1; reads legacy ~/.maw/peers.json during migration)";
+const PEERS_HELP: &str = "usage: maw peers <add|list|info|probe|probe-all|map|accept|remove|forget> [...]\n  add       <alias> <url> [--node <name>] [--ssh <target>] [--user <name>] [--allow-unreachable]\n            — register alias (auto-probes /info). Exits non-zero on handshake failure:\n              2=UNKNOWN/BAD_BODY/TLS  3=DNS  4=REFUSED  5=TIMEOUT  6=HTTP_4XX/5XX\n            --ssh sets the SSH config alias/target for cross-node attach; --user overrides SSH user.\n            --allow-unreachable keeps exit 0 even when the probe fails (CI/bootstrap).\n  list      [--discovered] [--all] [--json] [--limit N]\n            — tabular list of all peers. --discovered: LAN candidates from Scout (#1237).\n              --all: include already-paired (default hides). --limit: cap rows (default 50).\n  info      <alias>                         — JSON details for one peer (includes lastError if set)\n  probe     <alias>                         — re-run /info handshake; updates lastSeen / lastError (#565)\n  probe-all [--timeout <ms>] [--allow-unreachable]\n            — probe every peer in parallel; prints liveness table. Exit = worst PROBE_EXIT_CODE (#669).\n  accept    <node|zid-prefix> [--alias X] | --all (#1237)\n            — pair with a Scout-discovered peer. Shortest unambiguous prefix wins.\n              Refuses if pubkey already pins under a different alias (impersonation guard).\n  map       — federation map: node, oracle, up/down, resolved IP, and flags\n              (loopback-self = probe hit our own serve; dup-node = shared node name).\n  remove    <alias>                         — remove (idempotent)\n  forget    <alias>                         — clear cached pubkey so next contact re-TOFUs (#804 Step 2)\n\nstorage: maw state peers.json (v1; reads legacy ~/.maw/peers.json during migration)";
 const PEERS_DEFAULT_STALE_TTL_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 const PEERS_DEFAULT_PROBE_TIMEOUT_MS: u64 = 2_000;
 const PEERS_FAKE_NOW_ENV: &str = "MAW_RS_PEERS_FAKE_NOW";
@@ -37,6 +37,10 @@ struct PeersPeerNative {
     ssh: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     ssh_user: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    auth_ok: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    auth_error: Option<String>,
 }
 
 fn peers_version_one() -> u8 { 1 }
@@ -61,6 +65,7 @@ fn peers_dispatch(argv: &[String]) -> Result<CliOutput, String> {
         "forget" => peers_cmd_forget(&positional),
         "probe" => peers_cmd_probe(&positional),
         "probe-all" => peers_cmd_probe_all(argv),
+        "map" => Ok(peers_cmd_map()),
         "accept" => peers_cmd_accept(argv, &positional),
         _ => Ok(CliOutput { code: 1, stdout: format!("{PEERS_HELP}\n"), stderr: format!("maw peers: unknown subcommand \"{sub}\" (expected add|list|info|probe|probe-all|accept|remove|forget)\n") }),
     }
@@ -196,24 +201,74 @@ fn peers_cmd_probe(positional: &[&str]) -> Result<CliOutput, String> {
     Ok(CliOutput { code, stdout, stderr: peers_probe_stderr(alias, &url, &probe) })
 }
 
+/// One probe-all row: `(alias, url, status_code_string)`.
+type PeersProbeRow = (String, String, String);
+
+/// Probe every stored peer and persist the refreshed identity / lastSeen back to
+/// `peers.json` through the single peer-store writer (`peers_apply_probe_result` +
+/// `peers_save_store`). Shared by `maw peers probe-all` and the serve background
+/// refresh so probe results have exactly ONE write path — never the read-only
+/// federation-map render (#677/#684). Returns the per-peer rows and the worst probe
+/// exit code (`0` when the store is empty).
+fn peers_probe_all_and_persist(timeout_ms: u64) -> Result<(Vec<PeersProbeRow>, i32), String> {
+    peers_probe_all_and_persist_with(timeout_ms, &peers_probe_peer)
+}
+
+/// See [`peers_probe_all_and_persist`]. The `probe` seam is split out so a test can
+/// drive the persistence deterministically without real network I/O.
+///
+/// Lost-update safety: the peer list is snapshotted for probing, but each result is
+/// applied onto a **freshly re-read** store just before saving — so a concurrent
+/// `maw peers add` / `remove` during the slow, network-bound probe loop is not
+/// clobbered by a stale in-memory copy (the sweep's load→save window is otherwise
+/// ~timeout×peers long, ~12s on a 10-peer fleet). Each result only touches the
+/// probe-owned fields (`lastSeen` / `lastError` / `node` / `identity` / `pubkey` /
+/// `authOk`) via `peers_apply_probe_result`, never `url` or `addedAt`, so the sweep
+/// and the CLI cannot fight over a peer's non-probe fields. A residual sub-millisecond
+/// reload→save window remains; a lock file would close it (follow-up, #689).
+fn peers_probe_all_and_persist_with(
+    timeout_ms: u64,
+    probe: &dyn Fn(&str, u64, &str) -> maw_peer::ProbePeerResult,
+) -> Result<(Vec<PeersProbeRow>, i32), String> {
+    let store = peers_load_store();
+    if store.peers.is_empty() {
+        return Ok((Vec::new(), 0));
+    }
+    let targets = store
+        .peers
+        .iter()
+        .map(|(alias, peer)| (alias.clone(), peer.url.clone()))
+        .collect::<Vec<_>>();
+    let mut rows = Vec::new();
+    let mut worst = 0;
+    let mut results = Vec::new();
+    for (alias, url) in &targets {
+        let now = peers_now_iso();
+        let result = probe(url, timeout_ms, &now);
+        worst = worst.max(peers_probe_exit_code(&result));
+        let status = result.error.as_ref().map_or("OK", |error| error.code.as_str());
+        rows.push((alias.clone(), url.clone(), status.to_owned()));
+        results.push((alias.clone(), result, now));
+    }
+    // Re-read fresh so a concurrent add/remove during the probe loop survives; apply
+    // only the probe-owned fields onto whatever peers still exist.
+    let mut fresh = peers_load_store();
+    for (alias, result, now) in &results {
+        if let Some(peer) = fresh.peers.get_mut(alias) {
+            peers_apply_probe_result(peer, result, now)?;
+        }
+    }
+    peers_save_store(&fresh)?;
+    Ok((rows, worst))
+}
+
 fn peers_cmd_probe_all(argv: &[String]) -> Result<CliOutput, String> {
     let timeout = if let Some(raw) = peers_flag_value(argv, "--timeout") { peers_parse_positive_u64(&raw, "usage: maw peers probe-all [--timeout <ms>]")? } else { PEERS_DEFAULT_PROBE_TIMEOUT_MS };
-    let mut store = peers_load_store();
-    if store.peers.is_empty() { return Ok(peers_ok("alias  url  status\n-----  ---  ------\n")); }
+    let (rows, worst) = peers_probe_all_and_persist(timeout)?;
     let mut stdout = String::from("alias  url  status\n-----  ---  ------\n");
-    let aliases = store.peers.keys().cloned().collect::<Vec<_>>();
-    let mut worst = 0;
-    for alias in aliases {
-        let url = store.peers.get(&alias).map(|peer| peer.url.clone()).unwrap_or_default();
-        let now = peers_now_iso();
-        let probe = peers_probe_peer(&url, timeout, &now);
-        if let Some(peer) = store.peers.get_mut(&alias) { peers_apply_probe_result(peer, &probe, &now)?; }
-        let code = peers_probe_exit_code(&probe);
-        worst = worst.max(code);
-        let status = probe.error.as_ref().map_or("OK", |error| error.code.as_str());
+    for (alias, url, status) in &rows {
         let _ = writeln!(stdout, "{alias}  {url}  {status}");
     }
-    peers_save_store(&store)?;
     let allow = argv.iter().any(|arg| arg == "--allow-unreachable");
     Ok(CliOutput { code: if allow { 0 } else { worst }, stdout, stderr: String::new() })
 }
@@ -235,7 +290,58 @@ fn peers_probe_peer(url: &str, timeout_ms: u64, now: &str) -> maw_peer::ProbePee
     let info = peers_fetch_info(url, timeout_ms);
     // Best-effort /api/identity fetch so TOFU can pin the pubkey (#545); older peers without the endpoint stay unpinned.
     let identity = if matches!(info, maw_peer::ProbeInfoOutcome::Body(_)) { peers_fetch_identity(url, timeout_ms) } else { None };
-    maw_peer::probe_peer_from_plan(&maw_peer::ProbePeerPlan { url: url.to_owned(), now: now.to_owned(), dns_error: None, info, identity })
+    // Resolve the URL host to an IP so the map can flag the `m5.local → 127.0.0.1`
+    // trap (loopback = the probe hit our OWN serve, not the remote peer).
+    let resolved_ip = peers_resolve_ip(url);
+    // Read-only signed auth probe (POST /api/probe verifies the v3 from-signature
+    // and has no side effect) — only when /info succeeded, so we do not sign
+    // requests to an unreachable host. None when we cannot sign (no key/token).
+    let auth_probe = if matches!(info, maw_peer::ProbeInfoOutcome::Body(_)) {
+        federation_probe_auth(url, timeout_ms)
+    } else {
+        maw_transport::PeerProbeAuthResult::default()
+    };
+    maw_peer::probe_peer_from_plan(&maw_peer::ProbePeerPlan {
+        url: url.to_owned(),
+        now: now.to_owned(),
+        dns_error: None,
+        info,
+        identity,
+        resolved_ip,
+        auth_ok: auth_probe.ok,
+        auth_error: auth_probe.reason,
+    })
+}
+
+/// Resolve the host in a peer URL to a **routable** IP, so a probe can tell a
+/// real remote from our own serve (`m5.local` may resolve to `127.0.0.1`). For a
+/// non-loopback host, link-local (`fe80::/10`, `169.254/16`) and loopback
+/// addresses are skipped and IPv4 is preferred — otherwise `getaddrinfo` can
+/// hand back a zone-less link-local IPv6 first that nothing can connect to.
+/// Best effort: `None` when the URL has no host or DNS fails.
+fn peers_resolve_ip(url: &str) -> Option<String> {
+    use std::net::{IpAddr, ToSocketAddrs};
+    let parsed = reqwest::Url::parse(url).ok()?;
+    let host = parsed.host_str()?;
+    let port = parsed.port_or_known_default().unwrap_or(3456);
+    let host_is_loopback =
+        host == "localhost" || host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback());
+    let routable = |ip: &IpAddr| -> bool {
+        if ip.is_loopback() {
+            return false;
+        }
+        match ip {
+            IpAddr::V4(v4) => !v4.is_link_local(),
+            IpAddr::V6(v6) => (v6.segments()[0] & 0xffc0) != 0xfe80,
+        }
+    };
+    let mut addrs = (host, port)
+        .to_socket_addrs()
+        .ok()?
+        .filter(|addr| host_is_loopback || routable(&addr.ip()))
+        .collect::<Vec<_>>();
+    addrs.sort_by_key(|addr| u8::from(addr.is_ipv6()));
+    addrs.into_iter().next().map(|addr| addr.ip().to_string())
 }
 
 fn peers_fetch_identity(url: &str, timeout_ms: u64) -> Option<maw_peer::ProbeRemoteIdentity> {
@@ -360,6 +466,8 @@ fn peers_apply_probe_result(peer: &mut PeersPeerNative, probe: &maw_peer::ProbeP
         peer.pubkey = Some(pubkey.clone());
     }
     if let Some(identity) = &probe.identity { peer.identity = Some(serde_json::to_value(identity).map_err(|error| format!("peers: render identity: {error}"))?); }
+    peer.auth_ok = probe.auth_ok;
+    peer.auth_error.clone_from(&probe.auth_error);
     Ok(())
 }
 
@@ -392,6 +500,142 @@ fn peers_format_list(rows: &[(String, PeersPeerNative, bool, Option<u64>)]) -> S
         lines.push(line);
     }
     lines.join("\n")
+}
+
+/// One terminal-map row for `maw peers map` — the federation as this node sees
+/// it: node + oracle identity, whether the last handshake succeeded, the IP the
+/// URL resolves to (loopback = we reached our own serve), and whether the node
+/// name is unique (a duplicate makes "us vs them" ambiguous).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PeersMapRow {
+    alias: String,
+    node: String,
+    oracle: String,
+    reachable: bool,
+    resolved_ip: Option<String>,
+    loopback_self: bool,
+    node_unique: bool,
+    auth_ok: Option<bool>,
+    auth_error: Option<String>,
+}
+
+/// Deterministic core of `maw peers map`: map the peer store to rows, with the
+/// IP resolver injected so it is testable without DNS.
+fn peers_map_rows(
+    store: &PeersStoreNative,
+    resolve: impl Fn(&str) -> Option<String>,
+) -> Vec<PeersMapRow> {
+    let mut node_counts = std::collections::BTreeMap::<String, usize>::new();
+    for peer in store.peers.values() {
+        if let Some(node) = peer.node.as_deref().filter(|node| !node.is_empty()) {
+            *node_counts.entry(node.to_owned()).or_insert(0) += 1;
+        }
+    }
+    store
+        .peers
+        .iter()
+        .map(|(alias, peer)| {
+            let node = peer.node.clone().unwrap_or_default();
+            let resolved_ip = resolve(&peer.url);
+            PeersMapRow {
+                alias: alias.clone(),
+                oracle: peer
+                    .identity
+                    .as_ref()
+                    .and_then(|identity| identity.get("oracle"))
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|oracle| !oracle.is_empty())
+                    .unwrap_or("-")
+                    .to_owned(),
+                reachable: peer.last_error.is_none(),
+                loopback_self: maw_peer::is_loopback_ip(resolved_ip.as_deref()),
+                node_unique: node_counts.get(&node).copied().unwrap_or(0) <= 1 && !node.is_empty(),
+                node: if node.is_empty() { "-".to_owned() } else { node },
+                resolved_ip,
+                auth_ok: peer.auth_ok,
+                auth_error: peer.auth_error.clone(),
+            }
+        })
+        .collect()
+}
+
+fn peers_format_map(rows: &[PeersMapRow]) -> String {
+    if rows.is_empty() {
+        return "no peers — the federation is empty (maw peers add <alias> <url>)".to_owned();
+    }
+    let header = ["alias", "node", "oracle", "reach", "ip", "flags"];
+    let data = rows
+        .iter()
+        .map(|row| {
+            let reach = if row.reachable { "up" } else { "down" };
+            let ip = row.resolved_ip.clone().unwrap_or_else(|| "-".to_owned());
+            let mut flags = Vec::new();
+            if row.loopback_self {
+                flags.push("loopback-self".to_owned());
+            }
+            if !row.node_unique {
+                flags.push("dup-node".to_owned());
+            }
+            if row.auth_ok == Some(false) {
+                // The reason this flags: `auth_ok` reflects the signed-request
+                // handshake used by /api/send, /api/probe, /api/wake -- the
+                // action-capable surface, which the fleet DOES always enforce
+                // (loopback-exempt only, no config opt-out). It is unrelated
+                // to whether read-only endpoints like /api/sessions answer --
+                // those are gated separately, by an opt-in bearer token, and
+                // are open by design when no token is configured (#685).
+                // Bare "auth-fail" with no reason is how #685 happened: a
+                // flag nobody could act on. Show the reason whenever it's
+                // known; "never negotiated" itself is real, useful information
+                // (distinct from "credential rejected"), not a placeholder.
+                flags.push(row.auth_error.as_deref().map_or_else(
+                    || "auth-fail".to_owned(),
+                    |reason| format!("auth-fail:{reason}"),
+                ));
+            }
+            let flags = if flags.is_empty() {
+                "-".to_owned()
+            } else {
+                flags.join(",")
+            };
+            [
+                row.alias.clone(),
+                row.node.clone(),
+                row.oracle.clone(),
+                reach.to_owned(),
+                ip,
+                flags,
+            ]
+        })
+        .collect::<Vec<_>>();
+    let widths = (0..header.len())
+        .map(|idx| {
+            data.iter()
+                .map(|cols| cols[idx].len())
+                .chain([header[idx].len()])
+                .max()
+                .unwrap_or(0)
+        })
+        .collect::<Vec<_>>();
+    let format_row = |cols: &[String]| {
+        cols.iter()
+            .enumerate()
+            .map(|(idx, col)| format!("{col:<width$}", width = widths[idx]))
+            .collect::<Vec<_>>()
+            .join("  ")
+    };
+    let mut lines = vec![
+        format_row(&header.map(str::to_owned)),
+        format_row(&widths.iter().map(|width| "-".repeat(*width)).collect::<Vec<_>>()),
+    ];
+    lines.extend(data.iter().map(|cols| format_row(cols)));
+    lines.join("\n")
+}
+
+fn peers_cmd_map() -> CliOutput {
+    let store = peers_load_store();
+    let rows = peers_map_rows(&store, peers_resolve_ip);
+    peers_ok(&format!("{}\n", peers_format_map(&rows)))
 }
 
 fn peers_load_store() -> PeersStoreNative {
@@ -478,6 +722,159 @@ mod peers_tests {
     fn peers_args(values: &[&str]) -> Vec<String> { values.iter().map(|value| (*value).to_owned()).collect() }
 
     #[test]
+    fn peers_map_rows_flag_loopback_self_duplicate_nodes_and_reachability() {
+        let record = |url: &str, node: &str, oracle: Option<&str>, errored: bool| PeersPeerNative {
+            url: url.to_owned(),
+            node: Some(node.to_owned()),
+            last_error: errored.then(|| serde_json::json!({"code": "DNS"})),
+            identity: oracle.map(|oracle| serde_json::json!({ "oracle": oracle })),
+            ..PeersPeerNative::default()
+        };
+        let mut store = PeersStoreNative {
+            version: 1,
+            peers: std::collections::BTreeMap::new(),
+        };
+        store.peers.insert(
+            "m5".to_owned(),
+            record("http://m5.local:3456", "m5", Some("atlas"), false),
+        );
+        store
+            .peers
+            .insert("d1".to_owned(), record("http://a:3456", "dup", None, true));
+        store
+            .peers
+            .insert("d2".to_owned(), record("http://b:3456", "dup", None, false));
+
+        // Stub resolver: m5.local resolves to loopback (the trap), others to LAN.
+        let rows = peers_map_rows(&store, |url| {
+            Some(if url.contains("m5.local") {
+                "127.0.0.1".to_owned()
+            } else {
+                "192.168.1.9".to_owned()
+            })
+        });
+        let row = |alias: &str| {
+            rows.iter()
+                .find(|row| row.alias == alias)
+                .cloned()
+                .expect("row present")
+        };
+        assert!(row("m5").loopback_self, "m5.local → 127.0.0.1 is loopback-self");
+        assert_eq!(row("m5").oracle, "atlas");
+        assert!(row("m5").node_unique);
+        assert!(!row("d1").node_unique, "two peers share node 'dup'");
+        assert!(!row("d1").reachable, "lastError set → down");
+        assert!(row("d2").reachable);
+        assert!(!row("d2").loopback_self);
+    }
+
+    #[test]
+    fn peers_format_map_carries_the_auth_error_reason_not_a_bare_flag() {
+        // #685 half 2: `auth_ok: false` with no reason is a flag the user
+        // can't act on. auth_ok reflects the signed-request handshake used
+        // by send/probe/wake (always enforced, loopback-exempt only) --
+        // separate from read-only endpoints like /api/sessions, which are
+        // gated by their own opt-in bearer token and answer regardless.
+        // Surfacing the reason here, rather than newly gating those
+        // read-only endpoints, is the fix: it doesn't change what the
+        // fleet enforces (already correct), it fixes what the map explains.
+        let row = PeersMapRow {
+            alias: "m5".to_owned(),
+            node: "m5".to_owned(),
+            oracle: "atlas".to_owned(),
+            reachable: true,
+            resolved_ip: Some("192.168.1.9".to_owned()),
+            loopback_self: false,
+            node_unique: true,
+            auth_ok: Some(false),
+            auth_error: Some("pubkey-mismatch".to_owned()),
+        };
+        let text = peers_format_map(&[row]);
+        assert!(text.contains("auth-fail:pubkey-mismatch"), "{text}");
+    }
+
+    #[test]
+    fn peers_map_dispatch_is_native() {
+        assert!(peers_format_map(&[]).contains("federation is empty"));
+    }
+
+    fn peers_probe_all_temp_store(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("maw-rs-probeall-{}-{}.json", std::process::id(), tag))
+    }
+
+    #[test]
+    fn probe_all_persist_advances_last_seen_off_a_frozen_value() {
+        // #684: the sweep exists to move lastSeen; a test must prove it does. Seed a peer
+        // frozen at lastSeen="1000", run the persist with a successful probe, and assert the
+        // stored value advanced. Deleting `peers_save_store` (or freezing the write) turns
+        // this RED — the silence #684 is about is caught here, not just the env knob.
+        let _guard = env_test_lock();
+        let _restore = EnvVarRestore::capture("PEERS_FILE");
+        let path = peers_probe_all_temp_store("advances");
+        std::fs::write(
+            &path,
+            r#"{"version":1,"peers":{"m5":{"url":"http://127.0.0.1:1/","addedAt":"1000","lastSeen":"1000"}}}"#,
+        )
+        .expect("seed store");
+        std::env::set_var("PEERS_FILE", &path);
+
+        let fake = |_url: &str, _timeout: u64, _now: &str| maw_peer::ProbePeerResult {
+            node: Some("m5".to_owned()),
+            identity: Some(maw_peer::PeerIdentity { oracle: "arra".to_owned(), node: "m5".to_owned() }),
+            pubkey: Some("pk".to_owned()),
+            error: None,
+            ..maw_peer::ProbePeerResult::default()
+        };
+        let (rows, worst) = peers_probe_all_and_persist_with(2_000, &fake).expect("persist");
+        assert_eq!(worst, 0);
+        assert_eq!(rows.len(), 1);
+
+        let reloaded = peers_load_store();
+        let peer = reloaded.peers.get("m5").expect("m5 present");
+        assert_ne!(peer.last_seen.as_deref(), Some("1000"), "lastSeen must advance, not freeze (#684)");
+        assert_eq!(
+            peer.identity.as_ref().and_then(|id| id.get("oracle")).and_then(|v| v.as_str()),
+            Some("arra"),
+            "probe-owned oracle is persisted through the one writer",
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn probe_all_persist_preserves_a_concurrent_add() {
+        // #689 lost-update race: a `maw peers add` that lands DURING the slow probe loop must
+        // not be clobbered by the sweep's stale in-memory copy. The probe fn writes a new peer
+        // mid-loop; the reload-before-save must preserve it. Reverting to saving the initially
+        // loaded store turns this RED (the new peer vanishes).
+        let _guard = env_test_lock();
+        let _restore = EnvVarRestore::capture("PEERS_FILE");
+        let path = peers_probe_all_temp_store("race");
+        std::fs::write(
+            &path,
+            r#"{"version":1,"peers":{"a":{"url":"http://127.0.0.1:1/","addedAt":"1000"}}}"#,
+        )
+        .expect("seed store");
+        std::env::set_var("PEERS_FILE", &path);
+
+        let race_path = path.clone();
+        let fake = move |_url: &str, _timeout: u64, _now: &str| {
+            // Simulate a concurrent `maw peers add b` landing while we probe peer a.
+            std::fs::write(
+                &race_path,
+                r#"{"version":1,"peers":{"a":{"url":"http://127.0.0.1:1/","addedAt":"1000"},"b":{"url":"http://127.0.0.1:2/","addedAt":"2000"}}}"#,
+            )
+            .expect("concurrent add");
+            maw_peer::ProbePeerResult { node: Some("a".to_owned()), error: None, ..maw_peer::ProbePeerResult::default() }
+        };
+        peers_probe_all_and_persist_with(2_000, &fake).expect("persist");
+
+        let reloaded = peers_load_store();
+        assert!(reloaded.peers.contains_key("b"), "concurrent add must survive the sweep (#689 lost-update)");
+        assert!(reloaded.peers.contains_key("a"), "probed peer still present");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
     fn peers_dispatch_registers_aliases_and_guards() {
         assert_eq!(dispatcher_status("peers"), DispatchKind::Native);
         assert_eq!(dispatcher_status("peer"), DispatchKind::Native);
@@ -497,6 +894,9 @@ mod peers_tests {
             dns_error: None,
             info: maw_peer::ProbeInfoOutcome::Body(maw_peer::ProbeInfoBody { maw: maw_peer::ProbeMawHandshake::SchemaObject("1".to_owned()), node: Some("peer-node".to_owned()), name: None, nickname: None }),
             identity,
+            resolved_ip: None,
+            auth_ok: None,
+            auth_error: None,
         })
     }
 
@@ -509,6 +909,27 @@ mod peers_tests {
         peers_apply_probe_result(&mut peer, &probe, "1700000000000").unwrap();
         assert_eq!(peer.pubkey.as_deref(), Some("pub-545"));
         assert_eq!(peer.pubkey_first_seen.as_deref(), Some("1700000000000"));
+    }
+
+    #[test]
+    fn peers_apply_probe_result_persists_the_auth_error_reason() {
+        // #685: `auth_ok: false` with no reason is the same disease as the six
+        // bugs behind #680 -- the peer record must persist WHY, so `peers info`
+        // can show it, not just a bare boolean the map already renders as
+        // "auth-fail".
+        let probe = maw_peer::ProbePeerResult {
+            node: Some("peer-node".to_owned()),
+            auth_ok: Some(false),
+            auth_error: Some("pubkey-mismatch".to_owned()),
+            ..maw_peer::ProbePeerResult::default()
+        };
+        let mut peer = PeersPeerNative { url: "http://peer.test:3456".to_owned(), ..PeersPeerNative::default() };
+        peers_apply_probe_result(&mut peer, &probe, "1700000000000").unwrap();
+        assert_eq!(peer.auth_ok, Some(false));
+        assert_eq!(peer.auth_error.as_deref(), Some("pubkey-mismatch"));
+
+        let value = serde_json::to_value(&peer).expect("serialize");
+        assert_eq!(value["authError"], "pubkey-mismatch", "{value}");
     }
 
     #[test]

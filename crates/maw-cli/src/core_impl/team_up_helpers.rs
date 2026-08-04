@@ -188,7 +188,7 @@ fn team_t3_render_bring(team: &str, opts: &TeamT3Options124) -> String {
     let mut out = format!("\x1b[36m⚡\x1b[0m bringing {} oracle(s) into workspace '{session}' (dry-run)\n", members.len());
     for oracle in members {
         let suffix = if team_t3_has(opts, TEAM_T3_SPLIT) && !team_t3_has(opts, TEAM_T3_GATHER) { " --split" } else { "" };
-        writeln!(out, "\x1b[90mwould wake {oracle} --session {session}{suffix}\x1b[0m").expect("write string");
+        let _ = writeln!(out, "\x1b[90mwould wake {oracle} --session {session}{suffix}\x1b[0m");
     }
     out.push_str("No changes made\n");
     out
@@ -269,13 +269,18 @@ fn team_t3_up_action(item: &TeamRosterItem124, opts: &TeamT3Options124) -> Strin
 fn team_t3_render_roster(title: &str, roster: &[TeamRosterItem124]) -> String {
     use std::fmt::Write as _;
     let mut out = format!("{title}\nrole\tidentity\tengine\tstate\taction\n");
-    for item in roster { writeln!(out, "{}\t{}\t{}\t{}\t{}", item.role, item.identity, item.engine, item.state, item.action).expect("write string"); }
+    for item in roster { let _ = writeln!(out, "{}\t{}\t{}\t{}\t{}", item.role, item.identity, item.engine, item.state, item.action); }
     out
 }
 
 fn team_t3_panes() -> Vec<TeamPane124> {
-    let raw = std::env::var("MAW_RS_TEAM_TMUX_PANES").unwrap_or_default();
-    raw.lines().filter_map(team_t3_parse_pane).collect()
+    if std::env::var_os("MAW_RS_TEAM_TMUX_PANES").is_some() {
+        let raw = std::env::var("MAW_RS_TEAM_TMUX_PANES").unwrap_or_default();
+        return raw.lines().filter_map(team_t3_parse_pane).collect();
+    }
+    let mut runner = maw_tmux::CommandTmuxRunner::default();
+    let args = vec!["-a".to_owned(), "-F".to_owned(), "#{session_name}|#{window_name}|#{pane_current_command}|#{pane_current_path}|#{pane_id}".to_owned()];
+    maw_tmux::TmuxRunner::run(&mut runner, "list-panes", &args).map_or_else(|_| Vec::new(), |raw| raw.lines().filter_map(team_t3_parse_pane).collect())
 }
 
 fn team_t3_parse_pane(line: &str) -> Option<TeamPane124> {
@@ -287,4 +292,52 @@ fn team_t3_is_live_command(command: &str) -> bool {
     let lower = command.to_ascii_lowercase();
     if matches!(lower.as_str(), "sh" | "bash" | "zsh" | "fish" | "-sh" | "-bash" | "-zsh") { return false; }
     lower.contains("claude") || lower.contains("codex") || lower.contains("omx") || lower.contains("node") || lower.contains("bun")
+}
+
+#[cfg(test)]
+mod team_up_helpers_tests124 {
+    use super::*;
+
+    #[test]
+    fn team_t3_panes_falls_back_to_real_tmux_query_when_fake_env_is_absent() {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let _guard = env_test_lock();
+        let seq = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!("maw-rs-team-up-helpers-{}-{seq}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("bin")).expect("bin");
+        let _path = EnvVarRestore::capture("PATH");
+        let _panes = EnvVarRestore::capture("MAW_RS_TEAM_TMUX_PANES");
+        std::env::remove_var("MAW_RS_TEAM_TMUX_PANES");
+        std::env::set_var("PATH", root.join("bin"));
+        std::fs::write(
+            root.join("bin/tmux"),
+            r#"#!/bin/sh
+if [ "$1" = list-panes ]; then
+  printf 'alpha|builder|codex|/repo/agents/builder|%%1\n'
+  exit 0
+fi
+exit 1
+"#,
+        )
+        .expect("write tmux shim");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mut perms = std::fs::metadata(root.join("bin/tmux")).expect("metadata").permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(root.join("bin/tmux"), perms).expect("chmod");
+        }
+
+        let panes = team_t3_panes();
+
+        assert_eq!(panes, vec![TeamPane124 {
+            session: "alpha".to_owned(),
+            window: "builder".to_owned(),
+            command: "codex".to_owned(),
+            path: "/repo/agents/builder".to_owned(),
+            pane_id: "%1".to_owned(),
+        }]);
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

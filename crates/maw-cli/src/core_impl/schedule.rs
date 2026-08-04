@@ -167,12 +167,18 @@ fn schedule_desired334(repo: &Path, job: &maw_schedule::Schedule) -> Result<maw_
 }
 
 fn schedule_sync_jobs334(repos: &[std::path::PathBuf], mode: maw_schedule_launchd::SyncMode, prune: bool) -> Result<String, String> {
-    let domain = schedule_domain334()?; let mut runner = maw_schedule_launchd::SystemLaunchctl; let mut desired = std::collections::BTreeSet::new(); let (mut changed, mut current) = (0, 0);
+    let domain = schedule_domain334()?; let mut runner = maw_schedule_launchd::SystemLaunchctl; let plist_root = schedule_plist_root334()?;
+    let home = std::env::var("HOME").map_err(|_| "HOME is not set".to_owned())?;
+    let controller = maw_schedule_launchd::boot_sync_job(&plist_root, &std::env::current_exe().map_err(|error| format!("maw executable: {error}"))?,
+        &home, &maw_state_dir(&current_xdg_env()).join("logs/schedule-sync.log"));
+    let controller_result = maw_schedule_launchd::sync_job(&controller, &domain, mode, &mut runner)?;
+    let controller_state = if controller_result.changed || !controller_result.before.is_healthy() { "changed" } else { "current" };
+    let mut desired = std::collections::BTreeSet::new(); let (mut changed, mut current) = (0, 0);
     for repo in repos { for job in maw_schedule_launchd::load_config(&repo.join(".maw/schedule.toml"))?.schedule { let target = schedule_desired334(repo, &job)?; desired.insert(target.label.clone());
         let result = maw_schedule_launchd::sync_job(&target, &domain, mode, &mut runner)?; if result.changed || !result.before.is_healthy() { changed += 1; } else { current += 1; } } }
-    let mut stale = 0; if prune { if let Ok(entries) = std::fs::read_dir(schedule_plist_root334()?) { for entry in entries.flatten() { let name = entry.file_name().to_string_lossy().into_owned();
-        if let Some(label) = name.strip_suffix(".plist").filter(|label| label.starts_with("com.maw.schedule.") && !desired.contains(*label)) { if maw_schedule_launchd::remove_job(label, &entry.path(), &domain, mode, &mut runner)? { stale += 1; } } } } }
-    Ok(format!("{changed} changed · {current} current · {stale} stale{}\n", if mode == maw_schedule_launchd::SyncMode::Check { " (check only)" } else { "" }))
+    let stale = if prune { maw_schedule_launchd::cleanup_stale_jobs(&plist_root, &desired, &domain, mode, &mut runner)? } else { 0 };
+    Ok(format!("{changed} changed · {current} current · {stale} stale · controller {controller_state} (reserved {}){}\n",
+        maw_schedule_launchd::CONTROLLER_LABEL_PREFIX, if mode == maw_schedule_launchd::SyncMode::Check { " (check only)" } else { "" }))
 }
 
 fn schedule_run334(argv: &[String]) -> Result<String, String> {
@@ -226,7 +232,10 @@ fn schedule_fire334(argv: &[String]) -> Result<String, String> {
             return serde_json::to_string(&finished).map(|value| format!("{value}\n")).map_err(|error| format!("encode outcome: {error}"));
         }
         let maw = std::env::current_exe().map_err(|error| format!("resolve maw executable: {error}"))?;
-        let mut runner = maw_tmux::CommandTmuxRunner::with_program(tmux.expect("headless run resolves tmux"));
+        let Some(tmux) = tmux else {
+            return Err("resolve tmux for Claude headless handoff: missing tmux path".to_owned());
+        };
+        let mut runner = maw_tmux::CommandTmuxRunner::with_program(tmux);
         if let Err(error) = schedule_handoff334(&mut runner, &run_id, &repo, &maw, &state) {
             store.finalize(&run_id, maw_schedule_runner::FinishRequest { exited_at: current_epoch_seconds(), exit_code: 1,
                 output_file_written: false, output_bytes: 0, deliverable_written: None, expected_output: None, error: Some(error.clone()) })?;

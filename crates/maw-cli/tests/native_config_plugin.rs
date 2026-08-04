@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)] // test code: panicking on unexpected state is idiomatic
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -50,6 +51,7 @@ fn run_config(root: &Path, args: &[&str]) -> Output {
     let fake_bin = fake_maw_path(root);
     Command::new(bin())
         .args(args)
+        .current_dir(root)
         .env_clear()
         .env("PATH", fake_bin)
         .env("HOME", root.join("home"))

@@ -369,7 +369,7 @@ fn team_push_list_row(out: &mut String, item: &(String, String, usize)) {
     let (name, store, members) = item;
     let status = if store == "vault" { "\x1b[90mprep-only\x1b[0m" } else { "\x1b[90mno live panes\x1b[0m" };
     let zombies = if store == "vault" { "\x1b[90m—\x1b[0m" } else { "0" };
-    writeln!(out, "  {name:<30}{store:<7}{members:<9}{status:<26}{zombies}").expect("write string");
+    let _ = writeln!(out, "  {name:<30}{store:<7}{members:<9}{status:<26}{zombies}");
 }
 
 fn team_team_names() -> Vec<String> {
@@ -378,15 +378,15 @@ fn team_team_names() -> Vec<String> {
 
 fn team_push_status(out: &mut String, name: &str) {
     use std::fmt::Write as _;
-    let Some(config) = team_read_json::<TeamConfig122>(&team_paths(name).tool_config) else { writeln!(out, "\x1b[33m⚠\x1b[0m team not found: {name}").expect("write string"); return; };
+    let Some(config) = team_read_json::<TeamConfig122>(&team_paths(name).tool_config) else { let _ = writeln!(out, "\x1b[33m⚠\x1b[0m team not found: {name}"); return; };
     let members: Vec<_> = config.members.iter().filter(|m| m.agent_type.as_deref() != Some("team-lead")).collect();
-    writeln!(out, "\n\x1b[36;1mTeam: {name}\x1b[0m ({} agents)\n", members.len()).expect("write string");
-    writeln!(out, "  Agent           Status    Task                          Pane").expect("write string");
-    writeln!(out, "  ─────────────── ───────── ───────────────────────────── ────────").expect("write string");
-    for member in &members { writeln!(out, "  {:<15} \x1b[90midle\x1b[0m      {:<29} {}", member.name, "-", member.tmux_pane_id.as_deref().unwrap_or("-" )).expect("write string"); }
+    let _ = writeln!(out, "\n\x1b[36;1mTeam: {name}\x1b[0m ({} agents)\n", members.len());
+    let _ = writeln!(out, "  Agent           Status    Task                          Pane");
+    let _ = writeln!(out, "  ─────────────── ───────── ───────────────────────────── ────────");
+    for member in &members { let _ = writeln!(out, "  {:<15} \x1b[90midle\x1b[0m      {:<29} {}", member.name, "-", member.tmux_pane_id.as_deref().unwrap_or("-" )); }
     let tasks = team_read_tasks(name);
     let done = tasks.iter().filter(|task| task.status == "completed").count();
-    writeln!(out, "\n  \x1b[90mTasks: {done}/{} done | Agents: 0 working, {} idle\x1b[0m", tasks.len(), members.len()).expect("write string");
+    let _ = writeln!(out, "\n  \x1b[90mTasks: {done}/{} done | Agents: 0 working, {} idle\x1b[0m", tasks.len(), members.len());
 }
 
 fn team_read_tasks(team: &str) -> Vec<TeamTask122> {
@@ -411,19 +411,19 @@ fn team_read_oracle_registry(team: &str) -> Option<TeamOracleRegistry122> {
 fn team_push_member_row(out: &mut String, member: &TeamOracleMember122) {
     use std::fmt::Write as _;
     let added = member.added_at.split('T').next().unwrap_or("");
-    writeln!(out, "  \x1b[32m●\x1b[0m {:<30} \x1b[90mrole:\x1b[0m {:<15} \x1b[90madded:\x1b[0m {added}", member.oracle, member.role).expect("write string");
+    let _ = writeln!(out, "  \x1b[32m●\x1b[0m {:<30} \x1b[90mrole:\x1b[0m {:<15} \x1b[90madded:\x1b[0m {added}", member.oracle, member.role);
 }
 
 fn team_render_lives(agent: &str, dir: &std::path::Path) -> String {
     use std::fmt::Write as _;
     let files = team_dir_names(dir);
     let mut out = format!("\n  \x1b[36;1m{agent} — past lives\x1b[0m\n\n");
-    writeln!(out, "  standing orders: {}", if files.iter().any(|f| f == "standing-orders.md") { "\x1b[32myes\x1b[0m" } else { "\x1b[90mno\x1b[0m" }).expect("write string");
+    let _ = writeln!(out, "  standing orders: {}", if files.iter().any(|f| f == "standing-orders.md") { "\x1b[32myes\x1b[0m" } else { "\x1b[90mno\x1b[0m" });
     let findings: Vec<_> = files.iter().filter(|f| f.ends_with("_findings.md")).collect();
-    writeln!(out, "  findings: {}", if findings.is_empty() { "\x1b[90mnone\x1b[0m".to_owned() } else { format!("\x1b[32m{}\x1b[0m", findings.len()) }).expect("write string");
-    for file in findings { writeln!(out, "    \x1b[90m{} ({} lines)\x1b[0m", file, team_line_count(&dir.join(file))).expect("write string"); }
+    let _ = writeln!(out, "  findings: {}", if findings.is_empty() { "\x1b[90mnone\x1b[0m".to_owned() } else { format!("\x1b[32m{}\x1b[0m", findings.len()) });
+    for file in findings { let _ = writeln!(out, "    \x1b[90m{} ({} lines)\x1b[0m", file, team_line_count(&dir.join(file))); }
     let other: Vec<_> = files.into_iter().filter(|f| f != "standing-orders.md" && !f.ends_with("_findings.md")).collect();
-    if !other.is_empty() { writeln!(out, "  other: \x1b[90m{}\x1b[0m", other.join(", ")).expect("write string"); }
+    if !other.is_empty() { let _ = writeln!(out, "  other: \x1b[90m{}\x1b[0m", other.join(", ")); }
     out.push('\n');
     out
 }
@@ -506,17 +506,33 @@ fn team_parse_yaml_charter(text: &str) -> Result<TeamCharter122, String> {
     let mut charter = TeamCharter122::default();
     let mut current: Option<TeamCharterMember122> = None;
     let mut block = TeamYamlBlock122::None;
+    let mut member_block_scalar: Option<usize> = None;
     for raw in text.lines() {
         let line = raw.split('#').next().unwrap_or("").trim_end();
         if line.trim().is_empty() { continue; }
         let indent = line.chars().take_while(|ch| *ch == ' ').count();
         let trimmed = line.trim();
         if indent == 0 {
+            // A new top-level section ends the current member: flush it so a
+            // trailing block's fields (e.g. `lifecycle:\n  worktree: true`)
+            // cannot leak into and overwrite the last member's worktree (#658).
+            if let Some(member) = current.take() {
+                charter.members.push(member);
+            }
             block = TeamYamlBlock122::from_header(trimmed);
+            member_block_scalar = None;
         } else if team_yaml_block_line(trimmed, block, &mut charter) {
             continue;
         }
-        team_yaml_line(line, &mut charter, &mut current);
+        if let Some(block_indent) = member_block_scalar {
+            if indent > block_indent {
+                continue;
+            }
+            member_block_scalar = None;
+        }
+        if let Some(block_indent) = team_yaml_line(line, &mut charter, &mut current) {
+            member_block_scalar = Some(block_indent);
+        }
     }
     if let Some(member) = current.take() { charter.members.push(member); }
     team_charter_finish(charter)
@@ -565,27 +581,49 @@ fn team_yaml_key_value(trimmed: &str) -> Option<(String, String)> {
     Some((key.to_owned(), team_unquote(value)))
 }
 
-fn team_yaml_line(line: &str, charter: &mut TeamCharter122, current: &mut Option<TeamCharterMember122>) {
-    if let Some(rest) = line.strip_prefix("name:") { charter.name = team_unquote(rest); return; }
-    if let Some(rest) = line.strip_prefix("project:") { charter.project = Some(team_unquote(rest)); return; }
-    if let Some(rest) = line.strip_prefix("description:") { charter.description = team_unquote(rest); return; }
-    if let Some(rest) = line.strip_prefix("goal:") { charter.goal = team_unquote(rest); return; }
-    if let Some(rest) = line.strip_prefix("session:") { charter.session = Some(team_unquote(rest)); return; }
-    if line.trim() == "requires_human_approval: true" { charter.governance_requires_human_approval = true; return; }
-    if let Some(rest) = line.trim_start().strip_prefix("- role:") { if let Some(member) = current.take() { charter.members.push(member); } *current = Some(TeamCharterMember122 { role: team_unquote(rest), ..Default::default() }); return; }
-    if let Some(member) = current.as_mut() { team_yaml_member_line(line, member); }
+fn team_yaml_line(line: &str, charter: &mut TeamCharter122, current: &mut Option<TeamCharterMember122>) -> Option<usize> {
+    if let Some(rest) = line.strip_prefix("name:") { charter.name = team_unquote(rest); return None; }
+    if let Some(rest) = line.strip_prefix("project:") { charter.project = Some(team_unquote(rest)); return None; }
+    if let Some(rest) = line.strip_prefix("description:") { charter.description = team_unquote(rest); return None; }
+    if let Some(rest) = line.strip_prefix("goal:") { charter.goal = team_unquote(rest); return None; }
+    if let Some(rest) = line.strip_prefix("session:") { charter.session = Some(team_unquote(rest)); return None; }
+    if line.trim() == "requires_human_approval: true" { charter.governance_requires_human_approval = true; return None; }
+    if let Some(rest) = line.trim_start().strip_prefix("- role:") {
+        if let Some(member) = current.take() { charter.members.push(member); }
+        *current = Some(TeamCharterMember122 { role: team_unquote(rest), ..Default::default() });
+        return None;
+    }
+    current.as_mut().and_then(|member| team_yaml_member_line(line, member))
 }
 
-fn team_yaml_member_line(line: &str, member: &mut TeamCharterMember122) {
-    if let Some(rest) = line.trim_start().strip_prefix("worktree:") {
+fn team_yaml_member_line(line: &str, member: &mut TeamCharterMember122) -> Option<usize> {
+    let trimmed = line.trim_start();
+    if let Some(rest) = trimmed.strip_prefix("worktree:") {
         let value = team_unquote(rest);
         member.worktree_opt_out = team_worktree_literal_is_opt_out(&value);
         member.worktree = (!member.worktree_opt_out).then_some(value);
-        return;
+        return None;
     }
-    for (key, slot) in [("name:", &mut member.name), ("model:", &mut member.model), ("cwd:", &mut member.cwd), ("engine:", &mut member.engine), ("target:", &mut member.target), ("prompt:", &mut member.prompt), ("worktree:", &mut member.worktree), ("branch:", &mut member.branch)] {
-        if let Some(rest) = line.trim_start().strip_prefix(key) { *slot = Some(team_unquote(rest)); }
+    if let Some(rest) = trimmed.strip_prefix("prompt:") {
+        let value = team_unquote(rest);
+        let block_indent = team_yaml_value_is_block_scalar(&value).then(|| line.chars().take_while(|ch| *ch == ' ').count());
+        member.prompt = Some(value);
+        return block_indent;
     }
+    for (key, slot) in [("name:", &mut member.name), ("model:", &mut member.model), ("cwd:", &mut member.cwd), ("engine:", &mut member.engine), ("target:", &mut member.target), ("branch:", &mut member.branch)] {
+        if let Some(rest) = trimmed.strip_prefix(key) {
+            *slot = Some(team_unquote(rest));
+            return None;
+        }
+    }
+    None
+}
+
+fn team_yaml_value_is_block_scalar(value: &str) -> bool {
+    value
+        .trim()
+        .strip_prefix(['|', '>'])
+        .is_some_and(|rest| rest.chars().all(|ch| ch == '+' || ch == '-' || ch.is_ascii_digit()))
 }
 
 fn team_unquote(raw: &str) -> String {
@@ -630,14 +668,14 @@ fn team_format_plan(charter: &TeamCharter122) -> String {
 fn team_render_charter_plan(title: &str, charter: &TeamCharter122, artifacts: &[std::path::PathBuf], actions: &[&str]) -> String {
     use std::fmt::Write as _;
     let mut out = format!("{title}: {}\n", charter.name);
-    if !charter.description.is_empty() { writeln!(out, "description: {}", charter.description).expect("write string"); }
-    if !charter.goal.is_empty() { writeln!(out, "goal: {}", charter.goal.lines().next().unwrap_or("")).expect("write string"); }
-    writeln!(out, "\nmembers ({}):", charter.members.len()).expect("write string");
-    for member in &charter.members { writeln!(out, "  - {} ({})", member.role, team_member_bits(member)).expect("write string"); }
-    writeln!(out, "\nwould prepare artifacts:").expect("write string");
-    for artifact in artifacts { writeln!(out, "  - {}", artifact.display()).expect("write string"); }
-    writeln!(out, "\nphase-0 safety:").expect("write string");
-    for action in actions { writeln!(out, "  - {action}").expect("write string"); }
+    if !charter.description.is_empty() { let _ = writeln!(out, "description: {}", charter.description); }
+    if !charter.goal.is_empty() { let _ = writeln!(out, "goal: {}", charter.goal.lines().next().unwrap_or("")); }
+    let _ = writeln!(out, "\nmembers ({}):", charter.members.len());
+    for member in &charter.members { let _ = writeln!(out, "  - {} ({})", member.role, team_member_bits(member)); }
+    let _ = writeln!(out, "\nwould prepare artifacts:");
+    for artifact in artifacts { let _ = writeln!(out, "  - {}", artifact.display()); }
+    let _ = writeln!(out, "\nphase-0 safety:");
+    for action in actions { let _ = writeln!(out, "  - {action}"); }
     out
 }
 
@@ -657,7 +695,7 @@ fn team_format_preflight(charter: &TeamCharter122) -> (String, bool) {
     let checks = team_preflight_checks(charter);
     let errors = checks.iter().any(|(ok, _, _)| !ok);
     let mut out = format!("team charter preflight: {}\nstatus: {}\n\nchecks:\n", charter.name, if errors { "failed" } else { "passed" });
-    for (ok, label, detail) in checks { writeln!(out, "  {} {label}: {detail}", if ok { "✓" } else { "✗" }).expect("write string"); }
+    for (ok, label, detail) in checks { let _ = writeln!(out, "  {} {label}: {detail}", if ok { "✓" } else { "✗" }); }
     out.push_str("\npreflight safety:\n  - read-only preflight only\n  - no files written\n  - no tmux panes changed\n  - no claude processes spawned\n  - no maw bud or fleet writes\n");
     (out, errors)
 }
@@ -696,7 +734,7 @@ fn team_config_member_from_charter(member: &TeamCharterMember122) -> TeamMember1
 fn team_format_load(charter: &TeamCharter122, artifacts: &[std::path::PathBuf]) -> String {
     use std::fmt::Write as _;
     let mut out = format!("team charter loaded: {}\n\nwrote artifacts:\n", charter.name);
-    for artifact in artifacts { writeln!(out, "  - {}", artifact.display()).expect("write string"); }
+    for artifact in artifacts { let _ = writeln!(out, "  - {}", artifact.display()); }
     out.push_str("\nload safety:\n  - --no-spawn respected\n  - no tmux panes changed\n  - no claude processes spawned\n  - no maw bud or fleet writes\n\nnext: maw team list\n");
     out
 }
@@ -756,6 +794,97 @@ members:
         assert_eq!(charter.members[0].worktree.as_deref(), Some("agents/reviewer"));
         assert_eq!(charter.members[1].worktree, None);
         assert!(charter.members[1].worktree_opt_out);
+    }
+
+    #[test]
+    fn team_charter_last_member_prompt_block_does_not_overwrite_worktree() {
+        let charter = team_parse_charter(
+            r"name: alpha
+project: org/repo
+members:
+  - role: first
+    worktree: agents/first
+    branch: agents/first
+  - role: second
+    worktree: agents/second
+    branch: agents/second
+    prompt: |
+      Startup notes may mention legacy fallback fields.
+      worktree: second
+      branch: second
+",
+        )
+        .expect("charter");
+        assert_eq!(charter.members.len(), 2);
+        assert_eq!(charter.members[1].worktree.as_deref(), Some("agents/second"));
+        assert_eq!(charter.members[1].branch.as_deref(), Some("agents/second"));
+    }
+
+    #[test]
+    fn team_charter_trailing_lifecycle_block_does_not_overwrite_last_member_worktree() {
+        // #658: a top-level section after the last member (e.g. `lifecycle:`
+        // with `worktree: true`) must NOT leak into the still-open last member.
+        let charter = team_parse_charter(
+            r"name: alpha
+project: org/repo
+members:
+  - role: first
+    worktree: agents/first
+  - role: last
+    worktree: agents/last
+lifecycle:
+  worktree: true
+  merge_on_shutdown: false
+",
+        )
+        .expect("charter");
+        assert_eq!(charter.members.len(), 2);
+        assert_eq!(charter.members[1].role, "last");
+        assert_eq!(
+            charter.members[1].worktree.as_deref(),
+            Some("agents/last"),
+            "trailing lifecycle worktree:true must not clobber the last member"
+        );
+    }
+
+    #[test]
+    fn team_charter_coder_keeps_agents_worktree_when_first_or_last() {
+        for (label, yaml) in [
+            (
+                "coder-first",
+                r"name: alpha
+project: org/repo
+members:
+  - role: coder
+    worktree: agents/coder
+    branch: agents/coder
+    prompt: |
+      Do not treat prompt body text as member metadata.
+      worktree: coder
+  - role: lead
+    worktree: false
+",
+            ),
+            (
+                "coder-last",
+                r"name: alpha
+project: org/repo
+members:
+  - role: lead
+    worktree: false
+  - role: coder
+    worktree: agents/coder
+    branch: agents/coder
+    prompt: |
+      Do not treat prompt body text as member metadata.
+      worktree: coder
+",
+            ),
+        ] {
+            let charter = team_parse_charter(yaml).expect("charter");
+            let coder = charter.members.iter().find(|member| member.role == "coder").expect("coder member");
+            assert_eq!(coder.worktree.as_deref(), Some("agents/coder"), "{label}");
+        }
     }
 
     #[test]

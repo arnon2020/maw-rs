@@ -1,3 +1,4 @@
+#![allow(clippy::expect_used)] // test-support mock: poisoned-lock panic is the correct failure
 use super::GatewayEventSource;
 use std::{
     future::Future,
@@ -32,7 +33,9 @@ impl GatewayEventSource for MockGatewaySource {
         Box::pin(async move {
             self.events
                 .lock()
-                .expect("mock source")
+                .expect(
+                    "mock event queue mutex must remain unpoisoned because its only locked operation is Vec::pop, which cannot panic",
+                )
                 .pop()
                 .unwrap_or(Ok(None))
         })

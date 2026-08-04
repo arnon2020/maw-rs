@@ -100,6 +100,7 @@ pub struct ServecoreSharedState {
     pub lifecycle: ServecoreLifecycle,
     pub hub_workspaces: Arc<Vec<WorkspaceConfig>>,
     pub agents_node: Option<String>,
+    pub agents_oracle: Option<String>,
     pub agents_snapshot: Option<Arc<Vec<ServecoreAgentPane>>>,
     pub tmux_sessions_snapshot: Option<Arc<Vec<TmuxSession>>>,
     pub auth_workspace_key: Option<String>,
@@ -118,6 +119,7 @@ impl Default for ServecoreSharedState {
             lifecycle: ServecoreLifecycle::default(),
             hub_workspaces: Arc::new(Vec::new()),
             agents_node: None,
+            agents_oracle: None,
             agents_snapshot: None,
             tmux_sessions_snapshot: None,
             auth_workspace_key: None,
@@ -138,6 +140,12 @@ impl ServecoreSharedState {
     #[must_use]
     pub fn servecore_with_agents_node(mut self, node: Option<String>) -> Self {
         self.agents_node = node;
+        self
+    }
+
+    #[must_use]
+    pub fn servecore_with_agents_oracle(mut self, oracle: Option<String>) -> Self {
+        self.agents_oracle = oracle;
         self
     }
 
@@ -3017,6 +3025,7 @@ mod tests {
                 idle_timeout: Duration::from_secs(5),
                 heartbeat_interval: Duration::from_secs(5),
                 capture_interval: Duration::from_secs(2),
+                previews_interval: Duration::from_secs(2),
                 send_timeout: Duration::from_secs(2),
                 max_frame_bytes: 1024,
                 max_connections: 8,
@@ -3090,6 +3099,7 @@ mod tests {
             idle_timeout: Duration::from_millis(80),
             heartbeat_interval: Duration::from_millis(20),
             capture_interval: Duration::from_secs(2),
+            previews_interval: Duration::from_secs(2),
             send_timeout: Duration::from_millis(50),
             max_frame_bytes: 1024,
             max_connections: 8,

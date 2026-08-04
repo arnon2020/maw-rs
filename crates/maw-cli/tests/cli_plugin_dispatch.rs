@@ -1,7 +1,8 @@
-// The wasm-host import-bearing-WASM dispatch tests (#72 blocker 1 proofs)
-// were removed in the repo split — the wasm-dispatch/import-bearing.wasm
-// fixture they include_bytes!-welded now lives in
-// Soul-Brews-Studio/maw-fixtures @aecf20b6; rework/relocate tracked in #546.
+#![allow(clippy::unwrap_used, clippy::expect_used)] // test code: panicking on unexpected state is idiomatic
+                                                    // The wasm-host import-bearing-WASM dispatch tests (#72 blocker 1 proofs)
+                                                    // were removed in the repo split — the wasm-dispatch/import-bearing.wasm
+                                                    // fixture they include_bytes!-welded now lives in
+                                                    // Soul-Brews-Studio/maw-fixtures @aecf20b6; rework/relocate tracked in #546.
 use maw_cli::run_cli;
 use serde_json::json;
 use std::ffi::OsString;
@@ -108,6 +109,21 @@ fn write_bun_shim(dir: &Path) {
             .permissions();
         permissions.set_mode(0o755);
         std::fs::set_permissions(&shim, permissions).expect("chmod bun shim");
+    }
+}
+
+fn write_silent_bun_shim(dir: &Path) {
+    let shim = dir.join("bun");
+    write(&shim, "#!/bin/sh\nexit 0\n").expect("write silent bun shim");
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&shim)
+            .expect("shim metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&shim, permissions).expect("chmod silent bun shim");
     }
 }
 
@@ -293,6 +309,32 @@ fn dispatch_cli_plugin_reports_missing_bun_for_bun_dev_runtime() {
     assert_eq!(
         dispatched.stderr,
         "⚠ [dev-tier: bun] weather-demo — TS runs unsandboxed; ship tier = WASM (maw plugin build)\ndev-tier plugin weather-demo needs bun; install bun or build wasm\n"
+    );
+
+    remove_dir_all(root).expect("cleanup");
+}
+
+#[test]
+fn dispatch_cli_plugin_warns_when_bun_dev_plugin_exits_silently() {
+    let _guard = env_lock().lock().expect("env lock");
+    let _restore = EnvRestore::capture();
+    let root = temp_dir("bun-dev-silent");
+    let bin_dir = root.join("bin");
+    let plugins_dir = root.join("plugins");
+    create_dir_all(&bin_dir).expect("bin dir");
+    create_dir_all(&plugins_dir).expect("plugins dir");
+    write_silent_bun_shim(&bin_dir);
+    write_bun_dev_ts_plugin(&plugins_dir, "weather-demo", "weather report");
+    std::env::set_var("PATH", &bin_dir);
+    std::env::set_var("MAW_PLUGINS_DIR", &plugins_dir);
+
+    let dispatched = run_cli(&args(&["weather", "report"]));
+
+    assert_eq!(dispatched.code, 0, "{}", dispatched.stderr);
+    assert!(dispatched.stdout.is_empty(), "{}", dispatched.stdout);
+    assert_eq!(
+        dispatched.stderr,
+        "⚠ [dev-tier: bun] weather-demo — TS runs unsandboxed; ship tier = WASM (maw plugin build)\nplugin weather-demo exited 0 with no output — maw executes the entry file, it does not import it; if your entry only exports a default function add an `import.meta.main` block\n"
     );
 
     remove_dir_all(root).expect("cleanup");

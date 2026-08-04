@@ -1,5 +1,7 @@
 use super::*;
 
+// The state directory is required by preflight before the plan can be rendered.
+#[allow(clippy::expect_used)]
 pub(super) fn bind(env: &DiscordEnv, args: &[String], log: &mut Vec<String>) -> bool {
     let Some(bot) = args.first() else {
         log.push(
@@ -80,7 +82,9 @@ pub(super) fn bind(env: &DiscordEnv, args: &[String], log: &mut Vec<String>) -> 
     log.push(format!("    cwd:     {}", cwd.display()));
     log.push(format!(
         "    state:   {}",
-        state_dir.expect("checked").display()
+        state_dir
+            .expect("state directory must exist because failed preflight returns before planning")
+            .display()
     ));
     log.push("    command: claude --channels plugin:discord@claude-plugins-official".to_owned());
     log.push(String::new());

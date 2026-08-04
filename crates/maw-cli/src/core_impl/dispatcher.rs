@@ -74,8 +74,8 @@ use maw_transport::{
     classify_error, classify_symmetric_federation_status, FederationPeerStatus, FederationPeerView,
     FederationStatus, PairStatus, PeerFederationStatus, PeerFederationStatusResult,
     SymmetricFederationStatus, Transport, TransportFailureReason, TransportResult, TransportRouter,
-    HttpRequest as TransportHttpRequest, PeerSendRequest, PeerWakeRequest, ReqwestHttpTransportIo,
-    TransportTarget,
+    HttpRequest as TransportHttpRequest, PeerProbeAuthResult, PeerSendRequest, PeerWakeRequest,
+    ReqwestHttpTransportIo, TransportTarget,
 };
 use maw_worktree::{
     resolve_worktree_window, Session as WorktreeSession, Window as WorktreeWindow,
@@ -250,6 +250,7 @@ const DISPATCH_01: &[DispatcherEntry] = &[
     DispatcherEntry { command: "--help", handler: Handler::Sync(usage_handler) },
     DispatcherEntry { command: "-h", handler: Handler::Sync(usage_handler) },
     DispatcherEntry { command: "help", handler: Handler::Sync(usage_handler) },
+    DispatcherEntry { command: "commands", handler: Handler::Sync(commands_handler) },
     DispatcherEntry { command: "--version", handler: Handler::Sync(version_handler) },
     DispatcherEntry { command: "-v", handler: Handler::Sync(version_handler) },
     DispatcherEntry { command: "version", handler: Handler::Sync(version_handler) },
@@ -461,8 +462,15 @@ fn dispatcher_target(command: &str) -> DispatchTarget {
         })
 }
 
-fn usage_handler(_: &[String]) -> CliOutput {
+fn usage_handler(args: &[String]) -> CliOutput {
+    if args.iter().any(|arg| arg == "--all" || arg == "all") {
+        return usage_all_ok();
+    }
     usage_ok()
+}
+
+fn commands_handler(_: &[String]) -> CliOutput {
+    usage_all_ok()
 }
 
 fn version_handler(_: &[String]) -> CliOutput {
@@ -920,6 +928,53 @@ mod ts_plugin_dispatch_decision_tests {
         assert!(!called.get(), "runtime=bun-dev should bypass the probe");
         std::fs::remove_dir_all(dir).expect("cleanup");
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn dispatch_bun_dev_plugin_prefers_ctx_cwd_and_falls_back_to_plugin_dir() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let _env_guard = env_test_lock();
+        let _path_restore = EnvVarRestore::capture("PATH");
+        let (plugin_dir, plugin) = load_ts_plugin("bun-dev-cwd", Some("bun-dev"));
+        let caller_dir = temp_plugin_dir("caller-cwd");
+        let shim_dir = temp_plugin_dir("fake-bun-bin");
+        let fake_bun = shim_dir.join("bun");
+        std::fs::write(&fake_bun, "#!/bin/sh\npwd -P\n").expect("fake bun");
+        let mut permissions = std::fs::metadata(&fake_bun).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_bun, permissions).expect("chmod");
+        let mut path_entries = vec![shim_dir.clone()];
+        if let Some(path) = std::env::var_os("PATH") {
+            path_entries.extend(std::env::split_paths(&path));
+        }
+        std::env::set_var("PATH", std::env::join_paths(path_entries).expect("PATH"));
+
+        let caller_ctx = InvokeContext {
+            source: InvokeSource::Cli,
+            args: Vec::new(),
+            cwd: Some(caller_dir.to_string_lossy().into_owned()),
+            home: None,
+        };
+        let caller_output = dispatch_bun_dev_plugin(&plugin, &caller_ctx);
+        assert_eq!(caller_output.code, 0);
+        assert_eq!(
+            caller_output.stdout,
+            format!("{}\n", caller_dir.canonicalize().expect("caller").display())
+        );
+
+        let fallback_ctx = InvokeContext { cwd: None, ..caller_ctx };
+        let fallback_output = dispatch_bun_dev_plugin(&plugin, &fallback_ctx);
+        assert_eq!(fallback_output.code, 0);
+        assert_eq!(
+            fallback_output.stdout,
+            format!("{}\n", plugin_dir.canonicalize().expect("plugin").display())
+        );
+
+        std::fs::remove_dir_all(plugin_dir).expect("cleanup plugin");
+        std::fs::remove_dir_all(caller_dir).expect("cleanup caller");
+        std::fs::remove_dir_all(shim_dir).expect("cleanup bun");
+    }
 }
 
 fn dispatch_bun_dev_plugin(plugin: &LoadedPlugin, ctx: &InvokeContext) -> CliOutput {
@@ -932,21 +987,35 @@ fn dispatch_bun_dev_plugin(plugin: &LoadedPlugin, ctx: &InvokeContext) -> CliOut
         };
     };
 
+    let cwd = ctx.cwd.as_deref().map_or(plugin.dir.as_path(), Path::new);
     let output = std::process::Command::new("bun")
         .arg(entry_path)
         .args(&ctx.args)
-        .current_dir(&plugin.dir)
+        .current_dir(cwd)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .output();
 
     match output {
-        Ok(output) => CliOutput {
-            code: output.status.code().unwrap_or(1),
-            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-            stderr: format!("{banner}{}", String::from_utf8_lossy(&output.stderr)),
-        },
+        Ok(output) => {
+            let code = output.status.code().unwrap_or(1);
+            let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+            let plugin_stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+            let silence_note = if code == 0 && stdout.is_empty() && plugin_stderr.is_empty() {
+                format!(
+                    "plugin {} exited 0 with no output — maw executes the entry file, it does not import it; if your entry only exports a default function add an `import.meta.main` block\n",
+                    plugin.manifest.name
+                )
+            } else {
+                String::new()
+            };
+            CliOutput {
+                code,
+                stdout,
+                stderr: format!("{banner}{plugin_stderr}{silence_note}"),
+            }
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => CliOutput {
             code: 2,
             stdout: String::new(),
