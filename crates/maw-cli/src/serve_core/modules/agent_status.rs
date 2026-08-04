@@ -400,7 +400,7 @@ pub(crate) fn agentstatus_feed_query(
     let cutoff = now_ms.saturating_sub(AGENTSTATUS_FEED_ACTIVE_WINDOW_MS);
     let mut active_oracles = Vec::<String>::new();
     for event in &buffer {
-        if event.ts >= cutoff && !active_oracles.iter().any(|name| *name == event.oracle) {
+        if event.ts >= cutoff && !active_oracles.contains(&event.oracle) {
             active_oracles.push(event.oracle.clone());
         }
     }

@@ -2052,6 +2052,7 @@ mod serve_tests {
 
     #[tokio::test]
     async fn serve_api_send_auth_reject_is_logged_without_delivery() {
+        crate::serve_core::modules::agent_status::agentstatus_reset_global();
         let delivery = Arc::new(FakeServeDelivery::with_capture_agent());
         let app = serve_test_app_with_o6_keys_and_delivery(
             vec![serve_test_peer_pubkey("other-oracle:other-node", "wrong-first-peer-key")],
@@ -2069,20 +2070,24 @@ mod serve_tests {
             .oneshot(
                 axum::http::Request::builder()
                     .method("GET")
-                    .uri("/api/feed")
+                    .uri("/api/feed?event=auth-reject")
                     .body(Body::empty())
                     .expect("feed request"),
             )
             .await
             .expect("feed");
         let payload = response_json(feed).await;
-        assert_eq!(payload["events"][0]["state"], "failed");
-        assert_eq!(payload["events"][0]["decision"], "refuse-missing-peer-key");
+        assert_eq!(
+            payload["events"],
+            json!([]),
+            "public v1 feed must not expose raw auth-reject lifecycle records"
+        );
         assert!(delivery.sends().is_empty());
     }
 
     #[tokio::test]
     async fn serve_o6_from_aware_key_resolution_also_unblocks_api_feed() {
+        crate::serve_core::modules::agent_status::agentstatus_reset_global();
         let app = serve_test_app_with_o6_keys(
             vec![serve_test_peer_pubkey(FROM, KEY)],
             1_782_277_200,
@@ -2103,6 +2108,75 @@ mod serve_tests {
         let payload = response_json(response).await;
         assert_eq!(status, StatusCode::OK, "{payload}");
         assert_eq!(payload["ok"], true);
+    }
+
+    #[tokio::test]
+    async fn serve_api_feed_persists_v1_events_and_filters_before_limit_slice() {
+        crate::serve_core::modules::agent_status::agentstatus_reset_global();
+        let app = serve_test_app_with_o6_keys(
+            vec![serve_test_peer_pubkey(FROM, KEY)],
+            1_782_277_200,
+            Some(NON_LOOPBACK_TEST_PEER),
+        );
+        let response = app
+            .clone()
+            .oneshot(signed_json_request(
+                "POST",
+                "/api/feed",
+                r#"{"event":"MessageSend","oracle":"feed-test-sender-4533","message":"capture-agent: hello chat","ts":1782277200000}"#,
+                KEY,
+                FROM,
+                1_782_277_200,
+            ))
+            .await
+            .expect("feed post");
+        let status = response.status();
+        let payload = response_json(response).await;
+        assert_eq!(status, StatusCode::OK, "{payload}");
+
+        for idx in 0..3 {
+            crate::serve_core::modules::agent_status::agentstatus_feed_push_value(&json!({
+                "event": "Notification",
+                "oracle": format!("status-{idx}"),
+                "message": "tool event",
+                "ts": 1_782_277_201_000_u64 + idx,
+            }));
+        }
+
+        let filtered = app
+            .clone()
+            .oneshot(
+                axum::http::Request::get(
+                    "/api/feed?limit=2&event=MessageSend&oracle=feed-test-sender-4533",
+                )
+                    .body(Body::empty())
+                    .expect("filtered feed request"),
+            )
+            .await
+            .expect("filtered feed");
+        let payload = response_json(filtered).await;
+        assert_eq!(payload["total"], 1);
+        assert_eq!(payload["events"][0]["event"], "MessageSend");
+        assert_eq!(payload["events"][0]["oracle"], "feed-test-sender-4533");
+        assert_eq!(payload["events"][0]["message"], "capture-agent: hello chat");
+        assert!(payload["events"][0].get("data").is_none());
+        let timestamp = payload["events"][0]["timestamp"]
+            .as_str()
+            .expect("timestamp string");
+        assert!(timestamp.contains('T'), "{timestamp}");
+        assert!(timestamp.ends_with('Z'), "{timestamp}");
+
+        let excluded = app
+            .oneshot(
+                axum::http::Request::get("/api/feed?event=NoSuchEvent")
+                    .body(Body::empty())
+                    .expect("excluded feed request"),
+            )
+            .await
+            .expect("excluded feed");
+        let payload = response_json(excluded).await;
+        assert_eq!(payload["events"], json!([]));
+        assert_eq!(payload["total"], 0);
     }
 
     async fn spawn_test_server() -> SocketAddr {

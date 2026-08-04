@@ -253,7 +253,7 @@ mod send_acl_hotpath_tests {
         HeyConfig { node: Some("node-a".to_owned()), oracle: Some(oracle.to_owned()), route: RouteConfig::default() }
     }
 
-    fn send_audit_test_env(name: &str) -> (std::path::PathBuf, [EnvVarRestore; 11]) {
+    fn send_audit_test_env(name: &str) -> (std::path::PathBuf, [EnvVarRestore; 12]) {
         let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos());
         let root = std::env::temp_dir().join(format!("maw-send-audit-{name}-{}-{nanos}", std::process::id()));
         std::fs::create_dir_all(root.join("maw/config")).expect("config");
@@ -265,10 +265,10 @@ mod send_acl_hotpath_tests {
         // deliberately exercise pane-derived sender resolution still set
         // their own value after this returns; that layering is safe (capture
         // + restore nests correctly).
-        let restores = ["HOME", "MAW_HOME", "MAW_CONFIG_DIR", "MAW_DATA_DIR", "MAW_STATE_DIR", "USER", "LOGNAME", "HOSTNAME", "MAW_AUDIT_TEST_NOW_MS", "MAW_MESSAGE_LEDGER_DISABLE", "MAW_SESSION_WINDOW"].map(EnvVarRestore::capture);
+        let restores = ["HOME", "MAW_HOME", "MAW_CONFIG_DIR", "MAW_DATA_DIR", "MAW_STATE_DIR", "USER", "LOGNAME", "HOSTNAME", "MAW_AUDIT_TEST_NOW_MS", "MAW_MESSAGE_LEDGER_DISABLE", "MAW_SESSION_WINDOW", "MAW_SENDER"].map(EnvVarRestore::capture);
         std::env::set_var("HOME", root.join("home"));
         std::env::set_var("MAW_HOME", root.join("maw"));
-        for key in ["MAW_CONFIG_DIR", "MAW_DATA_DIR", "MAW_STATE_DIR", "LOGNAME", "MAW_MESSAGE_LEDGER_DISABLE", "MAW_SESSION_WINDOW"] { std::env::remove_var(key); }
+        for key in ["MAW_CONFIG_DIR", "MAW_DATA_DIR", "MAW_STATE_DIR", "LOGNAME", "MAW_MESSAGE_LEDGER_DISABLE", "MAW_SESSION_WINDOW", "MAW_SENDER"] { std::env::remove_var(key); }
         std::env::set_var("USER", "nat");
         std::env::set_var("HOSTNAME", "m5");
         std::env::set_var("MAW_AUDIT_TEST_NOW_MS", "1783565423347");
