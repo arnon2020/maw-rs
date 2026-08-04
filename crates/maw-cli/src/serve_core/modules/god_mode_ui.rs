@@ -12,8 +12,10 @@ use crate::serve_core::{
 };
 use axum::{
     body::{to_bytes, Body},
-    extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade},
-    extract::Query,
+    extract::{
+        ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade},
+        ConnectInfo, Query,
+    },
     http::{Request, StatusCode, Uri},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -23,11 +25,12 @@ use maw_tmux::{TmuxSession, TmuxWindow};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     fs,
     io::{self, Write},
+    net::SocketAddr,
     path::{Component, Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex, OnceLock},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -36,6 +39,13 @@ const GODUI_POST_BODY_LIMIT: usize = 64 * 1024;
 const GODUI_PREVIEW_LINES: u32 = 15;
 const GODUI_CONFIG_FILE: &str = "maw.config.json";
 const GODUI_FLEET_PREFIX: &str = "fleet/";
+const GODUI_PIN_ATTEMPT_WINDOW_MS: u64 = 60_000;
+const GODUI_PIN_MAX_ATTEMPTS: u32 = 5;
+const GODUI_PIN_MAX_ATTEMPT_ENTRIES: usize = 1_000;
+const GODUI_PIN_RATE_LIMIT_ERROR: &str = "Too many attempts. Wait 1 minute.";
+
+#[cfg(test)]
+static GODUI_PIN_TEST_NOW: OnceLock<Mutex<Option<u64>>> = OnceLock::new();
 
 #[must_use]
 pub fn godui_lifecycle_module() -> ServecoreLifecycleModule {
@@ -70,6 +80,7 @@ where
         .route("/api/asks", get(godui_asks_get).post(godui_asks_post))
         .route("/api/pin-info", get(godui_pin_info_get))
         .route("/api/pin-set", post(godui_pin_set_post))
+        .route("/api/pin-verify", post(godui_pin_verify_post))
         .route("/api/config-files", get(godui_config_files_get))
         .route(
             "/api/config-file",
@@ -158,6 +169,31 @@ async fn godui_pin_set_post(Json(body): Json<GoduiPinSetRequest>) -> Response {
         )
             .into_response(),
     }
+}
+
+async fn godui_pin_verify_post(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Json(body): Json<GoduiPinVerifyRequest>,
+) -> Response {
+    let correct = godui_configured_pin();
+    if correct.is_empty() {
+        return Json(json!({"ok": true})).into_response();
+    }
+
+    let key = godui_pin_attempt_key(peer);
+    if !godui_pin_attempt_register(&key, godui_pin_now_millis()) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({"ok": false, "error": GODUI_PIN_RATE_LIMIT_ERROR})),
+        )
+            .into_response();
+    }
+
+    let ok = body.pin.as_deref().unwrap_or_default() == correct;
+    if ok {
+        godui_pin_attempt_clear(&key);
+    }
+    Json(json!({"ok": ok})).into_response()
 }
 
 async fn godui_config_files_get() -> impl IntoResponse {
@@ -532,15 +568,104 @@ fn godui_asks_payload() -> Value {
 }
 
 fn godui_pin_info_payload() -> GoduiPinInfoResponse {
-    let config = maw_xdg::load_merged_config(&godui_xdg_env()).config;
-    let pin = config
-        .get("pin")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
+    let pin = godui_configured_pin();
     GoduiPinInfoResponse {
         length: pin.chars().count(),
         enabled: !pin.is_empty(),
     }
+}
+
+fn godui_configured_pin() -> String {
+    let config = maw_xdg::load_merged_config(&godui_xdg_env()).config;
+    config
+        .get("pin")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned()
+}
+
+#[derive(Clone, Copy, Debug)]
+struct GoduiPinAttempt {
+    count: u32,
+    reset_at: u64,
+}
+
+fn godui_pin_attempts() -> &'static Mutex<HashMap<String, GoduiPinAttempt>> {
+    static ATTEMPTS: OnceLock<Mutex<HashMap<String, GoduiPinAttempt>>> = OnceLock::new();
+    ATTEMPTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn godui_pin_attempt_key(peer: SocketAddr) -> String {
+    peer.ip().to_string()
+}
+
+fn godui_pin_attempt_register(key: &str, now: u64) -> bool {
+    let mut attempts = godui_pin_attempts()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    godui_pin_attempts_prune(&mut attempts, now, GODUI_PIN_MAX_ATTEMPT_ENTRIES);
+    let entry = attempts.entry(key.to_owned()).or_insert(GoduiPinAttempt {
+        count: 0,
+        reset_at: now.saturating_add(GODUI_PIN_ATTEMPT_WINDOW_MS),
+    });
+    if now > entry.reset_at {
+        entry.count = 0;
+        entry.reset_at = now.saturating_add(GODUI_PIN_ATTEMPT_WINDOW_MS);
+    }
+    entry.count = entry.count.saturating_add(1);
+    entry.count <= GODUI_PIN_MAX_ATTEMPTS
+}
+
+fn godui_pin_attempts_prune(
+    attempts: &mut HashMap<String, GoduiPinAttempt>,
+    now: u64,
+    max_entries: usize,
+) -> usize {
+    let mut pruned = 0;
+    let expired = attempts
+        .iter()
+        .filter_map(|(key, entry)| (now > entry.reset_at).then_some(key.clone()))
+        .collect::<Vec<_>>();
+    for key in expired {
+        if attempts.remove(&key).is_some() {
+            pruned += 1;
+        }
+    }
+    if attempts.len() > max_entries {
+        let overflow = attempts.len() - max_entries;
+        let mut oldest = attempts
+            .iter()
+            .map(|(key, entry)| (key.clone(), entry.reset_at))
+            .collect::<Vec<_>>();
+        oldest.sort_by_key(|(_, reset_at)| *reset_at);
+        for (key, _) in oldest.into_iter().take(overflow) {
+            if attempts.remove(&key).is_some() {
+                pruned += 1;
+            }
+        }
+    }
+    pruned
+}
+
+fn godui_pin_attempt_clear(key: &str) {
+    let mut attempts = godui_pin_attempts()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    attempts.remove(key);
+}
+
+fn godui_pin_now_millis() -> u64 {
+    #[cfg(test)]
+    {
+        let fixed = GODUI_PIN_TEST_NOW
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(now) = *fixed {
+            return now;
+        }
+    }
+    godui_now_millis()
 }
 
 fn godui_config_files_payload() -> Value {
@@ -858,6 +983,11 @@ struct GoduiPinInfoResponse {
 
 #[derive(Clone, Debug, Deserialize)]
 struct GoduiPinSetRequest {
+    pin: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct GoduiPinVerifyRequest {
     pin: Option<String>,
 }
 
@@ -1847,6 +1977,228 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn godui_pin_verify_unset_returns_ok_without_rate_limit_attempt() {
+        let _lock = godui_env_test_lock().await;
+        godui_pin_test_reset(Some(1_000));
+        let root = godui_test_root("pin-verify-unset");
+        let home = root.join("home");
+        let config_dir = root.join("config");
+        fs::create_dir_all(&config_dir).expect("config dir");
+        fs::write(config_dir.join("maw.config.json"), "{}").expect("config write");
+        let _guards = [
+            EnvGuard::set("HOME", &home.to_string_lossy()),
+            EnvGuard::set("MAW_CONFIG_DIR", &config_dir.to_string_lossy()),
+            EnvGuard::set("MAW_XDG", "1"),
+            EnvGuard::unset("MAW_HOME"),
+        ];
+        let app = godui_test_app();
+
+        let peer = godui_test_peer(10);
+        let (status, body) = godui_request_json_with_headers(
+            &app,
+            Method::POST,
+            "/api/pin-verify",
+            r#"{"pin":"anything"}"#,
+            &[("x-forwarded-for", "proxy")],
+            peer,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, json!({"ok": true}));
+        assert!(godui_pin_attempts_are_empty());
+
+        godui_pin_test_reset(None);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn godui_pin_verify_tracks_failures_limits_and_clears_on_success() {
+        let _lock = godui_env_test_lock().await;
+        godui_pin_test_reset(Some(10_000));
+        let root = godui_test_root("pin-verify-limit");
+        let home = root.join("home");
+        let config_dir = root.join("config");
+        fs::create_dir_all(&config_dir).expect("config dir");
+        fs::write(config_dir.join("maw.config.json"), r#"{"pin":"123"}"#).expect("config write");
+        let _guards = [
+            EnvGuard::set("HOME", &home.to_string_lossy()),
+            EnvGuard::set("MAW_CONFIG_DIR", &config_dir.to_string_lossy()),
+            EnvGuard::set("MAW_XDG", "1"),
+            EnvGuard::unset("MAW_HOME"),
+        ];
+        let app = godui_test_app();
+
+        let local_peer = godui_test_peer(11);
+        let local_key = godui_pin_attempt_key(local_peer);
+        let rate_peer = godui_test_peer(12);
+        let rate_key = godui_pin_attempt_key(rate_peer);
+
+        let (status, body) = godui_request_json_with_headers(
+            &app,
+            Method::POST,
+            "/api/pin-verify",
+            r#"{"pin":"000"}"#,
+            &[],
+            local_peer,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, json!({"ok": false}));
+        assert_eq!(godui_pin_attempt_count(&local_key), Some(1));
+
+        let (status, body) = godui_request_json_with_headers(
+            &app,
+            Method::POST,
+            "/api/pin-verify",
+            r#"{"pin":"123"}"#,
+            &[],
+            local_peer,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, json!({"ok": true}));
+        assert_eq!(godui_pin_attempt_count(&local_key), None);
+
+        for _ in 0..GODUI_PIN_MAX_ATTEMPTS {
+            let (status, body) = godui_request_json_with_headers(
+                &app,
+                Method::POST,
+                "/api/pin-verify",
+                r#"{"pin":"bad"}"#,
+                &[("cf-connecting-ip", "rate")],
+                rate_peer,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body, json!({"ok": false}));
+        }
+        let (status, body) = godui_request_json_with_headers(
+            &app,
+            Method::POST,
+            "/api/pin-verify",
+            r#"{"pin":"bad"}"#,
+            &[("cf-connecting-ip", "rate")],
+            rate_peer,
+        )
+        .await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            body,
+            json!({"ok": false, "error": GODUI_PIN_RATE_LIMIT_ERROR})
+        );
+        assert_eq!(
+            godui_pin_attempt_count(&rate_key),
+            Some(GODUI_PIN_MAX_ATTEMPTS + 1)
+        );
+
+        godui_pin_test_reset(None);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn godui_pin_verify_window_expiry_resets_attempt_counter() {
+        let _lock = godui_env_test_lock().await;
+        godui_pin_test_reset(Some(1_000));
+        let root = godui_test_root("pin-verify-window");
+        let home = root.join("home");
+        let config_dir = root.join("config");
+        fs::create_dir_all(&config_dir).expect("config dir");
+        fs::write(config_dir.join("maw.config.json"), r#"{"pin":"9"}"#).expect("config write");
+        let _guards = [
+            EnvGuard::set("HOME", &home.to_string_lossy()),
+            EnvGuard::set("MAW_CONFIG_DIR", &config_dir.to_string_lossy()),
+            EnvGuard::set("MAW_XDG", "1"),
+            EnvGuard::unset("MAW_HOME"),
+        ];
+        let app = godui_test_app();
+        let old_peer = godui_test_peer(13);
+        let old_key = godui_pin_attempt_key(old_peer);
+
+        for _ in 0..GODUI_PIN_MAX_ATTEMPTS {
+            let (status, _) = godui_request_json_with_headers(
+                &app,
+                Method::POST,
+                "/api/pin-verify",
+                r#"{"pin":"bad"}"#,
+                &[("cf-connecting-ip", "old")],
+                old_peer,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+        }
+        assert_eq!(
+            godui_pin_attempt_count(&old_key),
+            Some(GODUI_PIN_MAX_ATTEMPTS)
+        );
+        godui_pin_test_set_now(70_000);
+        let (status, body) = godui_request_json_with_headers(
+            &app,
+            Method::POST,
+            "/api/pin-verify",
+            r#"{"pin":"bad"}"#,
+            &[("cf-connecting-ip", "old")],
+            old_peer,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, json!({"ok": false}));
+        assert_eq!(godui_pin_attempt_count(&old_key), Some(1));
+
+        godui_pin_test_reset(None);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn godui_pin_verify_ignores_spoofed_forwarding_headers_for_rate_limit_key() {
+        let _lock = godui_env_test_lock().await;
+        godui_pin_test_reset(Some(5_000));
+        let root = godui_test_root("pin-verify-spoofed-headers");
+        let home = root.join("home");
+        let config_dir = root.join("config");
+        fs::create_dir_all(&config_dir).expect("config dir");
+        fs::write(config_dir.join("maw.config.json"), r#"{"pin":"42"}"#).expect("config write");
+        let _guards = [
+            EnvGuard::set("HOME", &home.to_string_lossy()),
+            EnvGuard::set("MAW_CONFIG_DIR", &config_dir.to_string_lossy()),
+            EnvGuard::set("MAW_XDG", "1"),
+            EnvGuard::unset("MAW_HOME"),
+        ];
+        let app = godui_test_app();
+        let peer = godui_test_peer(14);
+        let key = godui_pin_attempt_key(peer);
+
+        let (status, body) = godui_request_json_with_headers(
+            &app,
+            Method::POST,
+            "/api/pin-verify",
+            r#"{"pin":"bad"}"#,
+            &[("x-forwarded-for", "bucket-1")],
+            peer,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, json!({"ok": false}));
+        let (status, body) = godui_request_json_with_headers(
+            &app,
+            Method::POST,
+            "/api/pin-verify",
+            r#"{"pin":"bad"}"#,
+            &[("x-forwarded-for", "bucket-2")],
+            peer,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, json!({"ok": false}));
+
+        assert_eq!(godui_pin_attempt_count(&key), Some(2));
+        assert_eq!(godui_pin_attempt_count("bucket-1"), None);
+        assert_eq!(godui_pin_attempt_count("bucket-2"), None);
+
+        godui_pin_test_reset(None);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
     async fn godui_post_routes_persist_json_and_return_ok() {
         let root = godui_test_root("post");
         fs::create_dir_all(&root).expect("root");
@@ -1932,6 +2284,34 @@ mod tests {
         serde_json::from_slice(&body).expect("response json")
     }
 
+    async fn godui_request_json_with_headers(
+        app: &Router,
+        method: Method,
+        uri: &str,
+        body: &str,
+        headers: &[(&str, &str)],
+        peer: SocketAddr,
+    ) -> (StatusCode, Value) {
+        let mut request = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json");
+        for (key, value) in headers {
+            request = request.header(*key, *value);
+        }
+        let mut request = request.body(Body::from(body.to_owned())).expect("request");
+        request.extensions_mut().insert(ConnectInfo(peer));
+        let response = app.clone().oneshot(request).await.expect("response");
+        let status = response.status();
+        let body = to_bytes(response.into_body(), GODUI_POST_BODY_LIMIT)
+            .await
+            .expect("response body");
+        (
+            status,
+            serde_json::from_slice(&body).expect("response json"),
+        )
+    }
+
     async fn godui_request_status(
         app: &Router,
         method: Method,
@@ -1950,6 +2330,43 @@ mod tests {
             .await
             .expect("response")
             .status()
+    }
+
+    fn godui_pin_test_reset(now: Option<u64>) {
+        godui_pin_attempts()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        *GODUI_PIN_TEST_NOW
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = now;
+    }
+
+    fn godui_pin_test_set_now(now: u64) {
+        *GODUI_PIN_TEST_NOW
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(now);
+    }
+
+    fn godui_pin_attempt_count(key: &str) -> Option<u32> {
+        godui_pin_attempts()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(key)
+            .map(|entry| entry.count)
+    }
+
+    fn godui_pin_attempts_are_empty() -> bool {
+        godui_pin_attempts()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty()
+    }
+
+    fn godui_test_peer(last_octet: u8) -> SocketAddr {
+        SocketAddr::from(([198, 51, 100, last_octet], 49_152))
     }
 
     fn godui_test_root(name: &str) -> PathBuf {
