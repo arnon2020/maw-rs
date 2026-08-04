@@ -65,6 +65,7 @@ mod send_acl_hotpath_tests {
             "ui",
             None,
             &resolve,
+            "msg-test-inbox",
         );
         assert_eq!(out.code, 0, "stderr={}", out.stderr);
         assert!(out.stdout.starts_with("queued inbox arra-oracle-v3 "), "{}", out.stdout);
@@ -89,6 +90,7 @@ mod send_acl_hotpath_tests {
             "ui",
             None,
             &|_oracle: &str| None,
+            "msg-test-inbox-missing",
         );
         assert_eq!(out.code, 1);
         assert!(out.stdout.is_empty());
@@ -177,6 +179,47 @@ mod send_acl_hotpath_tests {
             send_route_gate("hey", "s", "hello fleet", &error).is_none(),
             "Error is not a delivery decision the gate should intercept — the existing Error arm handles it"
         );
+    }
+
+    #[test]
+    fn send_message_feed_event_matches_maw_js_shape_and_reuses_id() {
+        let id = "msg-one-logical-send";
+        let queued = send_build_message_lifecycle_feed_event(&SendMessageLifecycleFeedInput {
+            id,
+            ts: "2026-06-24T03:00:00.123Z".to_owned(),
+            direction: "outbound",
+            state: "queued",
+            channel: "hey",
+            route: "inbox",
+            from: "m5:atlas",
+            to: "local:bob",
+            target: Some("33-maw-rs:1"),
+            text: "[m5:atlas] hello chat",
+            last_line: Some("> ready"),
+            signed: true,
+        });
+        let delivered = send_build_message_lifecycle_feed_event(&SendMessageLifecycleFeedInput {
+            id,
+            ts: "2026-06-24T03:00:01.000Z".to_owned(),
+            direction: "outbound",
+            state: "delivered",
+            channel: "hey",
+            route: "local",
+            from: "m5:atlas",
+            to: "local:bob",
+            target: Some("33-maw-rs:1"),
+            text: "[m5:atlas] hello chat",
+            last_line: None,
+            signed: true,
+        });
+
+        assert_eq!(queued["event"], serde_json::json!("MessageSend"));
+        assert_eq!(
+            queued["message"],
+            serde_json::json!("outbound/queued m5:atlas → local:bob (33-maw-rs:1) [m5:atlas] hello chat")
+        );
+        assert_eq!(queued["data"]["id"], serde_json::json!(id));
+        assert_eq!(delivered["data"]["id"], serde_json::json!(id));
     }
 
     #[derive(Debug, Default)]
