@@ -44,6 +44,8 @@ const SERVECORE_PIPELINE_ORDER: &[&str] = &[
 ];
 static SERVECORE_WS_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
 const SERVECORE_ORCHESTRATION_BODY_LIMIT: usize = 64 * 1024;
+const SERVECORE_CORS_DEFAULT_METHODS: &str = "GET, POST, OPTIONS";
+const SERVECORE_CORS_CONFIG_METHODS: &str = "GET, POST, PUT, DELETE, OPTIONS";
 
 pub trait ServecoreEngine: Send + Sync {
     fn servecore_engine_name(&self) -> &'static str;
@@ -1460,6 +1462,7 @@ fn servecore_validate_path(path: &str) -> Result<(), String> {
 
 async fn servecore_cors_preflight(req: Request<Body>, next: Next) -> Response {
     let origin = req.headers().get("origin").cloned();
+    let allow_methods = servecore_cors_allow_methods(req.uri().path());
     let allow_headers = req
         .headers()
         .get("access-control-request-headers")
@@ -1468,19 +1471,38 @@ async fn servecore_cors_preflight(req: Request<Body>, next: Next) -> Response {
 
     if req.method() == Method::OPTIONS {
         let mut response = StatusCode::NO_CONTENT.into_response();
-        servecore_add_cors_headers(response.headers_mut(), origin.as_ref(), &allow_headers);
+        servecore_add_cors_headers(
+            response.headers_mut(),
+            origin.as_ref(),
+            &allow_headers,
+            allow_methods,
+        );
         return response;
     }
 
     let mut response = next.run(req).await;
-    servecore_add_cors_headers(response.headers_mut(), origin.as_ref(), &allow_headers);
+    servecore_add_cors_headers(
+        response.headers_mut(),
+        origin.as_ref(),
+        &allow_headers,
+        allow_methods,
+    );
     response
+}
+
+fn servecore_cors_allow_methods(path: &str) -> &'static str {
+    if path == "/api/config-file" {
+        SERVECORE_CORS_CONFIG_METHODS
+    } else {
+        SERVECORE_CORS_DEFAULT_METHODS
+    }
 }
 
 fn servecore_add_cors_headers(
     headers: &mut HeaderMap,
     origin: Option<&HeaderValue>,
     allow_headers: &HeaderValue,
+    allow_methods: &'static str,
 ) {
     let Some(origin) = origin else {
         return;
@@ -1488,7 +1510,7 @@ fn servecore_add_cors_headers(
     headers.insert("access-control-allow-origin", origin.clone());
     headers.insert(
         "access-control-allow-methods",
-        HeaderValue::from_static("GET, POST, OPTIONS"),
+        HeaderValue::from_static(allow_methods),
     );
     headers.insert("access-control-allow-headers", allow_headers.clone());
     headers.insert(
@@ -2710,6 +2732,7 @@ mod tests {
         );
     }
 
+    #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn servecore_cors_reflects_origin_on_preflight_and_404() {
         let app = servecore_apply_pipeline(servecore_mount_core_routes(Router::new()));
@@ -2757,6 +2780,7 @@ mod tests {
         );
 
         let missing = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method(Method::GET)
@@ -2781,6 +2805,47 @@ mod tests {
                 .get("access-control-allow-headers")
                 .and_then(|value| value.to_str().ok()),
             Some("Content-Type, Authorization")
+        );
+
+        let config_preflight = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::OPTIONS)
+                    .uri("/api/config-file")
+                    .header("origin", "https://god.buildwithoracle.com")
+                    .body(Body::empty())
+                    .expect("config preflight"),
+            )
+            .await
+            .expect("config preflight response");
+        assert_eq!(config_preflight.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            config_preflight
+                .headers()
+                .get("access-control-allow-methods")
+                .and_then(|value| value.to_str().ok()),
+            Some("GET, POST, PUT, DELETE, OPTIONS")
+        );
+
+        let toggle_preflight = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::OPTIONS)
+                    .uri("/api/config-file/toggle")
+                    .header("origin", "https://god.buildwithoracle.com")
+                    .body(Body::empty())
+                    .expect("toggle preflight"),
+            )
+            .await
+            .expect("toggle preflight response");
+        assert_eq!(toggle_preflight.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            toggle_preflight
+                .headers()
+                .get("access-control-allow-methods")
+                .and_then(|value| value.to_str().ok()),
+            Some("GET, POST, OPTIONS")
         );
     }
 
