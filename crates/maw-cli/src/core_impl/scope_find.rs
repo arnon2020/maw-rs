@@ -541,7 +541,7 @@ fn ghq_root_resolve_with_commands(
     mut run_command: impl FnMut(&str, &[&str]) -> Option<String>,
     home: Option<std::ffi::OsString>,
 ) -> std::path::PathBuf {
-    if let Some(value) = env_root {
+    if let Some(value) = env_root.filter(|value| !value.is_empty()) {
         return ghq_root_strip_host(std::path::PathBuf::from(value));
     }
     if let Some(value) = run_command("git", &["config", "--get", "ghq.root"]) {
@@ -1146,6 +1146,21 @@ mod scopefind_ghq_root_tests {
     fn git_config_root_used_when_env_unset() {
         let root = ghq_root_resolve(None, || Some("/opt/Code\n".to_owned()), os("/Users/nat"));
         assert_eq!(root, PathBuf::from("/opt/Code"));
+    }
+
+    #[test]
+    fn empty_env_var_falls_through_to_git_config() {
+        // A shell can export GHQ_ROOT="" (defined but empty) without meaning to set it --
+        // ghq itself ignores an empty value and continues to the next source, so this
+        // resolver must too rather than short-circuiting to an empty/relative root (#775).
+        let root = ghq_root_resolve(os(""), || Some("/opt/Code\n".to_owned()), os("/Users/nat"));
+        assert_eq!(root, PathBuf::from("/opt/Code"));
+    }
+
+    #[test]
+    fn empty_env_var_falls_through_to_home_ghq_when_no_other_source() {
+        let root = ghq_root_resolve(os(""), || None, os("/Users/nat"));
+        assert_eq!(root, PathBuf::from("/Users/nat/ghq"));
     }
 
     #[test]
