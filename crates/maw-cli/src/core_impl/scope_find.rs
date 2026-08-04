@@ -560,7 +560,7 @@ fn ghq_root_strip_host(mut path: std::path::PathBuf) -> std::path::PathBuf {
     path
 }
 
-fn fleet_read_dirs_for_env(env: &MawXdgEnv) -> Vec<std::path::PathBuf> {
+pub(crate) fn fleet_read_dirs_for_env(env: &MawXdgEnv) -> Vec<std::path::PathBuf> {
     let mut dirs = vec![
         maw_state_path(env, &["fleet"]),
         env.home_dir().join(".maw").join("fleet"),

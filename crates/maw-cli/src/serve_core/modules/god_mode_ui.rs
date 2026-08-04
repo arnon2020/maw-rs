@@ -177,7 +177,7 @@ async fn godui_config_file_get(Query(query): Query<GoduiConfigFileQuery>) -> Res
             Err(error) => godui_json_error(StatusCode::BAD_REQUEST, &error),
         };
     }
-    let Some((_, path)) = godui_fleet_path_from_request(file_path) else {
+    let Some((_, _, path)) = godui_fleet_path_from_request(file_path) else {
         return godui_json_error(StatusCode::FORBIDDEN, "invalid path");
     };
     if !path.exists() {
@@ -214,7 +214,7 @@ async fn godui_config_file_post(
             Err(error) => godui_ok_error(StatusCode::BAD_REQUEST, &error),
         };
     }
-    let Some((_, path)) = godui_fleet_path_from_request(file_path) else {
+    let Some((_, _, path)) = godui_fleet_path_from_request(file_path) else {
         return godui_ok_error(StatusCode::FORBIDDEN, "invalid path");
     };
     match fs::write(path, format!("{}\n", body.content)) {
@@ -230,7 +230,7 @@ async fn godui_config_file_delete(Query(query): Query<GoduiConfigFileQuery>) -> 
     if file_path.contains("..") {
         return godui_json_error(StatusCode::BAD_REQUEST, "invalid path");
     }
-    let Some((_, path)) = godui_fleet_path_from_request(file_path) else {
+    let Some((_, _, path)) = godui_fleet_path_from_request(file_path) else {
         return godui_json_error(StatusCode::BAD_REQUEST, "cannot delete");
     };
     if !path.exists() {
@@ -259,7 +259,7 @@ async fn godui_config_file_put(Json(body): Json<GoduiConfigFileCreateRequest>) -
     if serde_json::from_str::<Value>(&body.content).is_err() {
         return godui_json_error(StatusCode::BAD_REQUEST, "invalid JSON");
     }
-    let Some(path) = godui_confined_fleet_path(safe_name) else {
+    let Some(path) = godui_new_fleet_path(safe_name) else {
         return godui_json_error(StatusCode::BAD_REQUEST, "invalid path");
     };
     if let Some(parent) = path.parent() {
@@ -289,7 +289,7 @@ async fn godui_config_file_toggle_post(Query(query): Query<GoduiConfigFileQuery>
     if file_path.contains("..") {
         return godui_json_error(StatusCode::BAD_REQUEST, "invalid path");
     }
-    let Some((name, path)) = godui_fleet_path_from_request(file_path) else {
+    let Some((name, fleet_dir, path)) = godui_fleet_path_from_request(file_path) else {
         return godui_json_error(StatusCode::BAD_REQUEST, "invalid path");
     };
     if !path.exists() {
@@ -298,7 +298,7 @@ async fn godui_config_file_toggle_post(Query(query): Query<GoduiConfigFileQuery>
     let new_name = name
         .strip_suffix(".disabled")
         .map_or_else(|| format!("{name}.disabled"), str::to_owned);
-    let Some(new_path) = godui_confined_fleet_path(&new_name) else {
+    let Some(new_path) = godui_confined_fleet_path(&fleet_dir, &new_name) else {
         return godui_json_error(StatusCode::BAD_REQUEST, "invalid path");
     };
     match fs::rename(&path, &new_path) {
@@ -550,23 +550,25 @@ fn godui_config_files_payload() -> Value {
         "enabled": true,
     })];
     let mut seen = BTreeSet::new();
-    if let Ok(entries) = fs::read_dir(godui_core_paths().fleet_dir) {
-        let mut names = entries
-            .flatten()
-            .filter_map(|entry| entry.file_name().to_str().map(str::to_owned))
-            .filter(|name| godui_is_config_file_name(name))
-            .collect::<Vec<_>>();
-        names.sort();
-        for name in names {
-            if !seen.insert(name.clone()) {
-                continue;
+    for fleet_dir in godui_fleet_read_dirs() {
+        if let Ok(entries) = fs::read_dir(fleet_dir) {
+            let mut names = entries
+                .flatten()
+                .filter_map(|entry| entry.file_name().to_str().map(str::to_owned))
+                .filter(|name| godui_is_config_file_name(name))
+                .collect::<Vec<_>>();
+            names.sort();
+            for name in names {
+                if !seen.insert(name.clone()) {
+                    continue;
+                }
+                let enabled = !name.ends_with(".disabled");
+                files.push(json!({
+                    "name": name,
+                    "path": format!("{GODUI_FLEET_PREFIX}{name}"),
+                    "enabled": enabled,
+                }));
             }
-            let enabled = !name.ends_with(".disabled");
-            files.push(json!({
-                "name": name,
-                "path": format!("{GODUI_FLEET_PREFIX}{name}"),
-                "enabled": enabled,
-            }));
         }
     }
     json!({ "files": files })
@@ -642,20 +644,34 @@ fn godui_write_maw_config(config: &Value) -> Result<(), String> {
     crate::config_atomic_write(&crate::config_target_path(), &format!("{body}\n"))
 }
 
-fn godui_core_paths() -> maw_xdg::MawCorePaths {
-    maw_xdg::maw_core_paths(&godui_xdg_env())
+fn godui_fleet_read_dirs() -> Vec<PathBuf> {
+    crate::core_impl::fleet_read_dirs_for_env(&godui_xdg_env())
 }
 
-fn godui_fleet_path_from_request(file_path: &str) -> Option<(String, PathBuf)> {
+fn godui_fleet_write_dir() -> PathBuf {
+    maw_xdg::maw_state_path(&godui_xdg_env(), &["fleet"])
+}
+
+fn godui_fleet_path_from_request(file_path: &str) -> Option<(String, PathBuf, PathBuf)> {
     let name = file_path.strip_prefix(GODUI_FLEET_PREFIX)?;
-    let path = godui_confined_fleet_path(name)?;
-    Some((name.to_owned(), path))
+    godui_existing_fleet_path(name).map(|(fleet_dir, path)| (name.to_owned(), fleet_dir, path))
+}
+
+fn godui_existing_fleet_path(name: &str) -> Option<(PathBuf, PathBuf)> {
+    godui_fleet_read_dirs().into_iter().find_map(|fleet_dir| {
+        let path = godui_confined_fleet_path(&fleet_dir, name)?;
+        path.exists().then_some((fleet_dir, path))
+    })
+}
+
+fn godui_new_fleet_path(name: &str) -> Option<PathBuf> {
+    godui_confined_fleet_path(&godui_fleet_write_dir(), name)
 }
 
 // This is lexical confinement, not physical/canonical confinement: a symlink inside the
 // locally managed fleet tree can still resolve outside it. That residual matches maw-js
 // parity and is accepted here because this API cannot create symlinks from request data.
-fn godui_confined_fleet_path(name: &str) -> Option<PathBuf> {
+fn godui_confined_fleet_path(fleet_dir: &Path, name: &str) -> Option<PathBuf> {
     let relative = Path::new(name);
     if name.is_empty() || relative.is_absolute() {
         return None;
@@ -666,9 +682,8 @@ fn godui_confined_fleet_path(name: &str) -> Option<PathBuf> {
     {
         return None;
     }
-    let fleet_dir = godui_core_paths().fleet_dir;
     let path = fleet_dir.join(relative);
-    path.starts_with(&fleet_dir).then_some(path)
+    path.starts_with(fleet_dir).then_some(path)
 }
 
 fn godui_json_error(status: StatusCode, error: &str) -> Response {
@@ -1569,9 +1584,11 @@ mod tests {
         let _lock = godui_env_test_lock().await;
         let root = godui_test_root("config-routes");
         let home = root.join("home");
+        let state_dir = root.join("state");
         let config_dir = root.join("config");
-        let fleet_dir = config_dir.join("fleet");
-        fs::create_dir_all(&fleet_dir).expect("fleet dir");
+        let config_fleet_dir = config_dir.join("fleet");
+        let state_fleet_dir = state_dir.join("fleet");
+        fs::create_dir_all(&config_fleet_dir).expect("config fleet dir");
         fs::write(
             config_dir.join("maw.config.json"),
             serde_json::to_string_pretty(&json!({
@@ -1584,9 +1601,14 @@ mod tests {
             .expect("config json"),
         )
         .expect("config write");
-        fs::write(fleet_dir.join("01-alpha.json"), r#"{"name":"alpha"}"#).expect("fleet write");
+        fs::write(
+            config_fleet_dir.join("01-alpha.json"),
+            r#"{"name":"alpha"}"#,
+        )
+        .expect("fleet write");
         let _guards = [
             EnvGuard::set("HOME", &home.to_string_lossy()),
+            EnvGuard::set("MAW_STATE_DIR", &state_dir.to_string_lossy()),
             EnvGuard::set("MAW_CONFIG_DIR", &config_dir.to_string_lossy()),
             EnvGuard::set("MAW_XDG", "1"),
             EnvGuard::unset("MAW_HOME"),
@@ -1654,7 +1676,9 @@ mod tests {
         )
         .await;
         assert_eq!(response["ok"], true);
-        assert!(fs::read_to_string(fleet_dir.join("02-beta.json"))
+        assert!(state_fleet_dir.join("02-beta.json").exists());
+        assert!(!config_fleet_dir.join("02-beta.json").exists());
+        assert!(fs::read_to_string(state_fleet_dir.join("02-beta.json"))
             .expect("fleet saved")
             .ends_with('\n'));
 
@@ -1667,7 +1691,8 @@ mod tests {
         .await;
         assert_eq!(response["ok"], true);
         assert_eq!(response["newPath"], "fleet/02-beta.json.disabled");
-        assert!(fleet_dir.join("02-beta.json.disabled").exists());
+        assert!(state_fleet_dir.join("02-beta.json.disabled").exists());
+        assert!(!config_fleet_dir.join("02-beta.json.disabled").exists());
 
         let response = godui_request_json(
             &app,
@@ -1677,7 +1702,7 @@ mod tests {
         )
         .await;
         assert_eq!(response["ok"], true);
-        assert!(!fleet_dir.join("02-beta.json.disabled").exists());
+        assert!(!state_fleet_dir.join("02-beta.json.disabled").exists());
 
         let response =
             godui_request_json(&app, Method::POST, "/api/pin-set", r#"{"pin":"12-3x"}"#).await;
@@ -1695,24 +1720,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn godui_config_files_merge_state_legacy_and_config_with_precedence() {
+        let _lock = godui_env_test_lock().await;
+        let root = godui_test_root("config-fleet-multiroot");
+        let home = root.join("home");
+        let state_dir = root.join("state");
+        let config_dir = root.join("config");
+        let state_fleet = state_dir.join("fleet");
+        let legacy_fleet = home.join(".maw/fleet");
+        let config_fleet = config_dir.join("fleet");
+        fs::create_dir_all(&state_fleet).expect("state fleet");
+        fs::create_dir_all(&legacy_fleet).expect("legacy fleet");
+        fs::create_dir_all(&config_fleet).expect("config fleet");
+        fs::write(config_dir.join("maw.config.json"), "{}").expect("config write");
+        fs::write(state_fleet.join("01-alpha.json"), r#"{"name":"state"}"#).expect("state alpha");
+        fs::write(legacy_fleet.join("01-alpha.json"), r#"{"name":"legacy"}"#)
+            .expect("legacy alpha");
+        fs::write(
+            legacy_fleet.join("02-beta.json.disabled"),
+            r#"{"name":"beta"}"#,
+        )
+        .expect("legacy beta");
+        fs::write(config_fleet.join("03-gamma.json"), r#"{"name":"gamma"}"#).expect("config gamma");
+        let _guards = [
+            EnvGuard::set("HOME", &home.to_string_lossy()),
+            EnvGuard::set("MAW_STATE_DIR", &state_dir.to_string_lossy()),
+            EnvGuard::set("MAW_CONFIG_DIR", &config_dir.to_string_lossy()),
+            EnvGuard::set("MAW_XDG", "1"),
+            EnvGuard::unset("MAW_HOME"),
+        ];
+        let app = godui_test_app();
+
+        let response = godui_request_json(&app, Method::GET, "/api/config-files", "").await;
+        let files = response["files"].as_array().expect("files");
+        let paths = files
+            .iter()
+            .filter_map(|file| file["path"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            paths,
+            vec![
+                "maw.config.json",
+                "fleet/01-alpha.json",
+                "fleet/02-beta.json.disabled",
+                "fleet/03-gamma.json"
+            ]
+        );
+        assert_eq!(files[1]["enabled"], true);
+        assert_eq!(files[2]["enabled"], false);
+
+        let response = godui_request_json(
+            &app,
+            Method::GET,
+            "/api/config-file?path=fleet/01-alpha.json",
+            "",
+        )
+        .await;
+        assert_eq!(response["content"], r#"{"name":"state"}"#);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
     async fn godui_config_routes_reject_absolute_fleet_remainders() {
         let _lock = godui_env_test_lock().await;
         let root = godui_test_root("config-absolute-remainder");
         let home = root.join("home");
+        let state_dir = root.join("state");
         let config_dir = root.join("config");
-        let fleet_dir = config_dir.join("fleet");
-        fs::create_dir_all(&fleet_dir).expect("fleet dir");
+        let state_fleet = state_dir.join("fleet");
+        let legacy_fleet = home.join(".maw/fleet");
+        let config_fleet = config_dir.join("fleet");
+        fs::create_dir_all(&state_fleet).expect("state fleet");
+        fs::create_dir_all(&legacy_fleet).expect("legacy fleet");
+        fs::create_dir_all(&config_fleet).expect("config fleet");
         fs::write(config_dir.join("maw.config.json"), "{}").expect("config write");
+        for fleet_dir in [&state_fleet, &legacy_fleet, &config_fleet] {
+            fs::write(fleet_dir.join("01-decoy.json"), "{}").expect("decoy write");
+        }
         let victim = root.join("victim.json");
         fs::write(&victim, r#"{"secret":true}"#).expect("victim write");
         let _guards = [
             EnvGuard::set("HOME", &home.to_string_lossy()),
+            EnvGuard::set("MAW_STATE_DIR", &state_dir.to_string_lossy()),
             EnvGuard::set("MAW_CONFIG_DIR", &config_dir.to_string_lossy()),
             EnvGuard::set("MAW_XDG", "1"),
             EnvGuard::unset("MAW_HOME"),
         ];
         let decoded_path = format!("fleet/{}", victim.to_string_lossy());
         assert!(godui_fleet_path_from_request(&decoded_path).is_none());
+        for fleet_dir in godui_fleet_read_dirs() {
+            assert!(godui_confined_fleet_path(&fleet_dir, &victim.to_string_lossy()).is_none());
+        }
         let encoded_path = victim.to_string_lossy().replace('/', "%2F");
         let config_uri = format!("/api/config-file?path=fleet%2F{encoded_path}");
         let toggle_uri = format!("/api/config-file/toggle?path=fleet%2F{encoded_path}");
