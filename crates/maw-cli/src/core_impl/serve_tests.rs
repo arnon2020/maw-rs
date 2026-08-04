@@ -2070,7 +2070,7 @@ mod serve_tests {
             .oneshot(
                 axum::http::Request::builder()
                     .method("GET")
-                    .uri("/api/feed?event=auth-reject")
+                    .uri("/api/feed")
                     .body(Body::empty())
                     .expect("feed request"),
             )
@@ -2080,7 +2080,7 @@ mod serve_tests {
         assert_eq!(
             payload["events"],
             json!([]),
-            "public v1 feed must not expose raw auth-reject lifecycle records"
+            "auth-reject lifecycle records must not appear in the public v1 feed"
         );
         assert!(delivery.sends().is_empty());
     }
