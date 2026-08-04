@@ -38,11 +38,20 @@ mod serve_tests {
 
     #[test]
     fn serve_pane_looks_like_agent_matches_keywords_and_versioned_commands() {
-        assert!(serve_pane_looks_like_agent("codex", "shell"));
-        assert!(serve_pane_looks_like_agent("bash", "maw-rs-oracle"));
-        assert!(serve_pane_looks_like_agent("2.1.219", "some task status line"));
-        assert!(!serve_pane_looks_like_agent("bash", "nat-LOCAL (shell)"));
-        assert!(!serve_pane_looks_like_agent("sudo", "MAWRS-REMOTE (live, read-only)"));
+        assert!(serve_pane_looks_like_agent("codex", "shell", "console"));
+        assert!(serve_pane_looks_like_agent("bash", "maw-rs-oracle", "console"));
+        assert!(serve_pane_looks_like_agent("2.1.219", "some task status line", "console"));
+        assert!(serve_pane_looks_like_agent(
+            "node",
+            "\u{2839} some-worktree-dir",
+            "hound-codex-oracle"
+        ));
+        assert!(!serve_pane_looks_like_agent("bash", "nat-LOCAL (shell)", "console"));
+        assert!(!serve_pane_looks_like_agent(
+            "sudo",
+            "MAWRS-REMOTE (live, read-only)",
+            "console"
+        ));
     }
 
     fn console_session() -> RouteSession {
@@ -93,6 +102,38 @@ mod serve_tests {
             serve_non_agent_pane_warning_from_panes(&sessions, &panes, "no-such-session:0").is_none(),
             "target not found is a different, already-handled failure mode"
         );
+    }
+
+    #[test]
+    fn serve_non_agent_pane_warning_from_panes_accepts_codex_node_in_oracle_window() {
+        let sessions = vec![RouteSession {
+            name: "team".to_owned(),
+            windows: vec![RouteWindow {
+                index: 0,
+                name: "hound-codex-oracle".to_owned(),
+                active: true,
+                kind: None,
+            }],
+            source: None,
+        }];
+        let panes = vec![TmuxPane {
+            id: "%9".to_owned(),
+            command: "node".to_owned(),
+            target: "team:hound-codex-oracle.0".to_owned(),
+            title: "\u{2839} some-worktree-dir".to_owned(),
+            pid: Some(900),
+            cwd: None,
+            last_activity: None,
+        }];
+
+        assert!(serve_non_agent_pane_warning_from_panes(&sessions, &panes, "team:0").is_none());
+    }
+
+    async fn serve_agentstatus_feed_test_lock() -> tokio::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await
     }
 
     #[test]
@@ -2052,6 +2093,7 @@ mod serve_tests {
 
     #[tokio::test]
     async fn serve_api_send_auth_reject_is_logged_without_delivery() {
+        let _feed_lock = serve_agentstatus_feed_test_lock().await;
         crate::serve_core::modules::agent_status::agentstatus_reset_global();
         let delivery = Arc::new(FakeServeDelivery::with_capture_agent());
         let app = serve_test_app_with_o6_keys_and_delivery(
@@ -2087,6 +2129,7 @@ mod serve_tests {
 
     #[tokio::test]
     async fn serve_o6_from_aware_key_resolution_also_unblocks_api_feed() {
+        let _feed_lock = serve_agentstatus_feed_test_lock().await;
         crate::serve_core::modules::agent_status::agentstatus_reset_global();
         let app = serve_test_app_with_o6_keys(
             vec![serve_test_peer_pubkey(FROM, KEY)],
@@ -2112,6 +2155,7 @@ mod serve_tests {
 
     #[tokio::test]
     async fn serve_api_feed_persists_v1_events_and_filters_before_limit_slice() {
+        let _feed_lock = serve_agentstatus_feed_test_lock().await;
         crate::serve_core::modules::agent_status::agentstatus_reset_global();
         let app = serve_test_app_with_o6_keys(
             vec![serve_test_peer_pubkey(FROM, KEY)],

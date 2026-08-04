@@ -90,6 +90,82 @@
     }
 
     #[test]
+    fn send_text_retries_codex_pasted_content_placeholder_until_capture_clears() {
+        let long_text = "dispatch this work order\n".repeat(150);
+        let placeholder = "› [Pasted Content 2032 chars][Pasted Content 1022 chars]";
+        let runner = FakeRunner::with_responses(vec![
+            Ok("0"),
+            Ok(""),
+            Ok(""),
+            Ok(""),
+            Ok(placeholder),
+            Ok(placeholder),
+            Ok(""),
+            Ok("› "),
+            Ok("› "),
+        ]);
+        let mut client = TmuxClient::new(runner);
+        let mut sleeps = Vec::new();
+        let report = client
+            .send_text_with_sleeper("sess:oracle.0", &long_text, |duration| sleeps.push(duration))
+            .expect("send text ok");
+
+        assert_eq!(report.enter_attempts, 2);
+        assert!(!report.warned_pending);
+        assert_eq!(
+            client
+                .runner
+                .calls
+                .iter()
+                .filter(|(subcommand, args)| subcommand == "send-keys"
+                    && args
+                        == &vec![
+                            "-t".to_owned(),
+                            "sess:oracle.0".to_owned(),
+                            "Enter".to_owned()
+                        ])
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn send_text_does_not_retry_fake_pasted_content_placeholder() {
+        let long_text = "dispatch this work order\n".repeat(150);
+        let runner = FakeRunner::with_responses(vec![
+            Ok("0"),
+            Ok(""),
+            Ok(""),
+            Ok(""),
+            Ok("› [Pasted Content 1 chars] [Pasted Content 2 chars]"),
+            Ok("› [Pasted Content 0 chars]"),
+        ]);
+        let mut client = TmuxClient::new(runner);
+        let mut sleeps = Vec::new();
+        let report = client
+            .send_text_with_sleeper("sess:oracle.0", &long_text, |duration| sleeps.push(duration))
+            .expect("send text ok");
+
+        assert_eq!(report.enter_attempts, 1);
+        assert!(report.warned_pending);
+        assert_eq!(
+            client
+                .runner
+                .calls
+                .iter()
+                .filter(|(subcommand, args)| subcommand == "send-keys"
+                    && args
+                        == &vec![
+                            "-t".to_owned(),
+                            "sess:oracle.0".to_owned(),
+                            "Enter".to_owned()
+                        ])
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn send_text_waits_out_matching_redraw_before_retrying() {
         let runner = FakeRunner::with_responses(vec![
             Ok("0"),
