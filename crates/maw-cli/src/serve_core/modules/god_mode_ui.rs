@@ -13,18 +13,20 @@ use crate::serve_core::{
 use axum::{
     body::{to_bytes, Body},
     extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade},
+    extract::Query,
     http::{Request, StatusCode, Uri},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
     Extension, Json, Router,
 };
 use maw_tmux::{TmuxSession, TmuxWindow};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
-    path::{Path, PathBuf},
+    io::{self, Write},
+    path::{Component, Path, PathBuf},
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -32,6 +34,8 @@ use std::{
 const GODUI_TEAM_RECENT_MS: u64 = 2 * 60 * 60 * 1_000;
 const GODUI_POST_BODY_LIMIT: usize = 64 * 1024;
 const GODUI_PREVIEW_LINES: u32 = 15;
+const GODUI_CONFIG_FILE: &str = "maw.config.json";
+const GODUI_FLEET_PREFIX: &str = "fleet/";
 
 #[must_use]
 pub fn godui_lifecycle_module() -> ServecoreLifecycleModule {
@@ -65,6 +69,19 @@ where
         )
         .route("/api/asks", get(godui_asks_get).post(godui_asks_post))
         .route("/api/pin-info", get(godui_pin_info_get))
+        .route("/api/pin-set", post(godui_pin_set_post))
+        .route("/api/config-files", get(godui_config_files_get))
+        .route(
+            "/api/config-file",
+            get(godui_config_file_get)
+                .post(godui_config_file_post)
+                .put(godui_config_file_put)
+                .delete(godui_config_file_delete),
+        )
+        .route(
+            "/api/config-file/toggle",
+            post(godui_config_file_toggle_post),
+        )
         .route(
             "/ws",
             get(godui_ws_upgrade).layer(Extension(
@@ -101,6 +118,197 @@ async fn godui_asks_post(req: Request<Body>) -> Response {
 
 async fn godui_pin_info_get() -> impl IntoResponse {
     Json(godui_pin_info_payload()).into_response()
+}
+
+async fn godui_pin_set_post(Json(body): Json<GoduiPinSetRequest>) -> Response {
+    let pin = body
+        .pin
+        .unwrap_or_default()
+        .chars()
+        .filter(char::is_ascii_digit)
+        .collect::<String>();
+    let mut config = match crate::config_read_target() {
+        Ok(config) => config,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"ok": false, "error": error})),
+            )
+                .into_response()
+        }
+    };
+    let Some(map) = config.as_object_mut() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"ok": false, "error": "root config must be a JSON object"})),
+        )
+            .into_response();
+    };
+    map.insert("pin".to_owned(), Value::String(pin.clone()));
+    match godui_write_maw_config(&config) {
+        Ok(()) => Json(json!({
+            "ok": true,
+            "length": pin.chars().count(),
+            "enabled": !pin.is_empty(),
+        }))
+        .into_response(),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"ok": false, "error": error})),
+        )
+            .into_response(),
+    }
+}
+
+async fn godui_config_files_get() -> impl IntoResponse {
+    Json(godui_config_files_payload()).into_response()
+}
+
+async fn godui_config_file_get(Query(query): Query<GoduiConfigFileQuery>) -> Response {
+    let Some(file_path) = query.path.as_deref() else {
+        return godui_json_error(StatusCode::BAD_REQUEST, "path required");
+    };
+    if file_path.contains("..") {
+        return godui_json_error(StatusCode::BAD_REQUEST, "invalid path");
+    }
+    if file_path == GODUI_CONFIG_FILE {
+        return match godui_display_maw_config_content() {
+            Ok(content) => Json(json!({"content": content})).into_response(),
+            Err(error) => godui_json_error(StatusCode::BAD_REQUEST, &error),
+        };
+    }
+    let Some((_, path)) = godui_fleet_path_from_request(file_path) else {
+        return godui_json_error(StatusCode::FORBIDDEN, "invalid path");
+    };
+    if !path.exists() {
+        return godui_json_error(StatusCode::NOT_FOUND, "not found");
+    }
+    match fs::read_to_string(path) {
+        Ok(content) => Json(json!({"content": content})).into_response(),
+        Err(error) => godui_json_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    }
+}
+
+async fn godui_config_file_post(
+    Query(query): Query<GoduiConfigFileQuery>,
+    Json(body): Json<GoduiConfigFileSaveRequest>,
+) -> Response {
+    let Some(file_path) = query.path.as_deref() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"ok": false, "error": "path required"})),
+        )
+            .into_response();
+    };
+    if file_path.contains("..") {
+        return godui_ok_error(StatusCode::BAD_REQUEST, "invalid path");
+    }
+    let mut content = match serde_json::from_str::<Value>(&body.content) {
+        Ok(content) => content,
+        Err(error) => return godui_ok_error(StatusCode::BAD_REQUEST, &error.to_string()),
+    };
+    if file_path == GODUI_CONFIG_FILE {
+        godui_preserve_masked_env_values(&mut content);
+        return match godui_write_maw_config(&content) {
+            Ok(()) => Json(json!({"ok": true})).into_response(),
+            Err(error) => godui_ok_error(StatusCode::BAD_REQUEST, &error),
+        };
+    }
+    let Some((_, path)) = godui_fleet_path_from_request(file_path) else {
+        return godui_ok_error(StatusCode::FORBIDDEN, "invalid path");
+    };
+    match fs::write(path, format!("{}\n", body.content)) {
+        Ok(()) => Json(json!({"ok": true})).into_response(),
+        Err(error) => godui_ok_error(StatusCode::BAD_REQUEST, &error.to_string()),
+    }
+}
+
+async fn godui_config_file_delete(Query(query): Query<GoduiConfigFileQuery>) -> Response {
+    let Some(file_path) = query.path.as_deref() else {
+        return godui_json_error(StatusCode::BAD_REQUEST, "cannot delete");
+    };
+    if file_path.contains("..") {
+        return godui_json_error(StatusCode::BAD_REQUEST, "invalid path");
+    }
+    let Some((_, path)) = godui_fleet_path_from_request(file_path) else {
+        return godui_json_error(StatusCode::BAD_REQUEST, "cannot delete");
+    };
+    if !path.exists() {
+        return godui_json_error(StatusCode::NOT_FOUND, "not found");
+    }
+    match fs::remove_file(path) {
+        Ok(()) => Json(json!({"ok": true})).into_response(),
+        Err(error) => godui_json_error(StatusCode::BAD_REQUEST, &error.to_string()),
+    }
+}
+
+async fn godui_config_file_put(Json(body): Json<GoduiConfigFileCreateRequest>) -> Response {
+    if !Path::new(&body.name)
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+    {
+        return godui_json_error(StatusCode::BAD_REQUEST, "name must end with .json");
+    }
+    let Some(safe_name) = Path::new(&body.name)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+    else {
+        return godui_json_error(StatusCode::BAD_REQUEST, "name required");
+    };
+    if serde_json::from_str::<Value>(&body.content).is_err() {
+        return godui_json_error(StatusCode::BAD_REQUEST, "invalid JSON");
+    }
+    let Some(path) = godui_confined_fleet_path(safe_name) else {
+        return godui_json_error(StatusCode::BAD_REQUEST, "invalid path");
+    };
+    if let Some(parent) = path.parent() {
+        if let Err(error) = fs::create_dir_all(parent) {
+            return godui_json_error(StatusCode::BAD_REQUEST, &error.to_string());
+        }
+    }
+    let write_result = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .and_then(|mut file| file.write_all(format!("{}\n", body.content).as_bytes()));
+    match write_result {
+        Ok(()) => Json(json!({"ok": true, "path": format!("{GODUI_FLEET_PREFIX}{safe_name}")}))
+            .into_response(),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            godui_json_error(StatusCode::CONFLICT, "file already exists")
+        }
+        Err(error) => godui_json_error(StatusCode::BAD_REQUEST, &error.to_string()),
+    }
+}
+
+async fn godui_config_file_toggle_post(Query(query): Query<GoduiConfigFileQuery>) -> Response {
+    let Some(file_path) = query.path.as_deref() else {
+        return godui_json_error(StatusCode::BAD_REQUEST, "invalid path");
+    };
+    if file_path.contains("..") {
+        return godui_json_error(StatusCode::BAD_REQUEST, "invalid path");
+    }
+    let Some((name, path)) = godui_fleet_path_from_request(file_path) else {
+        return godui_json_error(StatusCode::BAD_REQUEST, "invalid path");
+    };
+    if !path.exists() {
+        return godui_json_error(StatusCode::NOT_FOUND, "not found");
+    }
+    let new_name = name
+        .strip_suffix(".disabled")
+        .map_or_else(|| format!("{name}.disabled"), str::to_owned);
+    let Some(new_path) = godui_confined_fleet_path(&new_name) else {
+        return godui_json_error(StatusCode::BAD_REQUEST, "invalid path");
+    };
+    match fs::rename(&path, &new_path) {
+        Ok(()) => Json(json!({
+            "ok": true,
+            "newPath": format!("{GODUI_FLEET_PREFIX}{new_name}"),
+        }))
+        .into_response(),
+        Err(error) => godui_json_error(StatusCode::BAD_REQUEST, &error.to_string()),
+    }
 }
 
 async fn godui_ws_upgrade(
@@ -335,6 +543,142 @@ fn godui_pin_info_payload() -> GoduiPinInfoResponse {
     }
 }
 
+fn godui_config_files_payload() -> Value {
+    let mut files = vec![json!({
+        "name": GODUI_CONFIG_FILE,
+        "path": GODUI_CONFIG_FILE,
+        "enabled": true,
+    })];
+    let mut seen = BTreeSet::new();
+    if let Ok(entries) = fs::read_dir(godui_core_paths().fleet_dir) {
+        let mut names = entries
+            .flatten()
+            .filter_map(|entry| entry.file_name().to_str().map(str::to_owned))
+            .filter(|name| godui_is_config_file_name(name))
+            .collect::<Vec<_>>();
+        names.sort();
+        for name in names {
+            if !seen.insert(name.clone()) {
+                continue;
+            }
+            let enabled = !name.ends_with(".disabled");
+            files.push(json!({
+                "name": name,
+                "path": format!("{GODUI_FLEET_PREFIX}{name}"),
+                "enabled": enabled,
+            }));
+        }
+    }
+    json!({ "files": files })
+}
+
+fn godui_is_config_file_name(name: &str) -> bool {
+    if Path::new(name)
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+    {
+        return true;
+    }
+    name.strip_suffix(".disabled").is_some_and(|base| {
+        Path::new(base)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+    })
+}
+
+fn godui_display_maw_config_content() -> Result<String, String> {
+    let mut config = maw_xdg::load_merged_config(&godui_xdg_env()).config;
+    let env_masked = godui_masked_env(&config);
+    if let Some(map) = config.as_object_mut() {
+        map.insert("env".to_owned(), Value::Object(env_masked));
+    }
+    serde_json::to_string_pretty(&config)
+        .map_err(|error| format!("failed to render config JSON: {error}"))
+}
+
+fn godui_masked_env(config: &Value) -> Map<String, Value> {
+    let mut masked = Map::new();
+    let Some(env) = config.get("env").and_then(Value::as_object) else {
+        return masked;
+    };
+    for (key, value) in env {
+        let Some(raw) = value.as_str() else {
+            continue;
+        };
+        let raw_len = raw.chars().count();
+        let mask = if raw_len <= 4 {
+            "\u{2022}".repeat(raw_len)
+        } else {
+            let prefix = raw.chars().take(3).collect::<String>();
+            format!("{prefix}{}", "\u{2022}".repeat((raw_len - 3).min(20)))
+        };
+        masked.insert(key.clone(), Value::String(mask));
+    }
+    masked
+}
+
+fn godui_preserve_masked_env_values(next: &mut Value) {
+    let Some(env) = next.get_mut("env").and_then(Value::as_object_mut) else {
+        return;
+    };
+    let current = maw_xdg::load_merged_config(&godui_xdg_env()).config;
+    let current_env = current.get("env").and_then(Value::as_object);
+    for (key, value) in env {
+        if !value.as_str().is_some_and(|text| text.contains('\u{2022}')) {
+            continue;
+        }
+        if let Some(current_value) = current_env.and_then(|current| current.get(key)) {
+            *value = current_value.clone();
+        }
+    }
+}
+
+fn godui_write_maw_config(config: &Value) -> Result<(), String> {
+    if !config.is_object() {
+        return Err("root config must be a JSON object".to_owned());
+    }
+    let body = serde_json::to_string_pretty(config)
+        .map_err(|error| format!("failed to render config JSON: {error}"))?;
+    crate::config_atomic_write(&crate::config_target_path(), &format!("{body}\n"))
+}
+
+fn godui_core_paths() -> maw_xdg::MawCorePaths {
+    maw_xdg::maw_core_paths(&godui_xdg_env())
+}
+
+fn godui_fleet_path_from_request(file_path: &str) -> Option<(String, PathBuf)> {
+    let name = file_path.strip_prefix(GODUI_FLEET_PREFIX)?;
+    let path = godui_confined_fleet_path(name)?;
+    Some((name.to_owned(), path))
+}
+
+// This is lexical confinement, not physical/canonical confinement: a symlink inside the
+// locally managed fleet tree can still resolve outside it. That residual matches maw-js
+// parity and is accepted here because this API cannot create symlinks from request data.
+fn godui_confined_fleet_path(name: &str) -> Option<PathBuf> {
+    let relative = Path::new(name);
+    if name.is_empty() || relative.is_absolute() {
+        return None;
+    }
+    if relative
+        .components()
+        .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return None;
+    }
+    let fleet_dir = godui_core_paths().fleet_dir;
+    let path = fleet_dir.join(relative);
+    path.starts_with(&fleet_dir).then_some(path)
+}
+
+fn godui_json_error(status: StatusCode, error: &str) -> Response {
+    (status, Json(json!({ "error": error }))).into_response()
+}
+
+fn godui_ok_error(status: StatusCode, error: &str) -> Response {
+    (status, Json(json!({ "ok": false, "error": error }))).into_response()
+}
+
 pub(crate) fn godui_ws_initial_frames(sessions: Vec<TmuxSession>) -> (Vec<String>, u64) {
     let agent_sessions = agentstatus_sessions_from_tmux(&sessions);
     let snapshot = agentstatus_poll_global(&agent_sessions);
@@ -495,6 +839,27 @@ struct GoduiTeamsResponse {
 struct GoduiPinInfoResponse {
     length: usize,
     enabled: bool,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct GoduiPinSetRequest {
+    pin: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct GoduiConfigFileQuery {
+    path: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct GoduiConfigFileSaveRequest {
+    content: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct GoduiConfigFileCreateRequest {
+    name: String,
+    content: String,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -873,6 +1238,12 @@ mod tests {
             std::env::set_var(key, value);
             Self(key, old)
         }
+
+        fn unset(key: &'static str) -> Self {
+            let old = std::env::var_os(key);
+            std::env::remove_var(key);
+            Self(key, old)
+        }
     }
 
     impl Drop for EnvGuard {
@@ -1162,6 +1533,7 @@ mod tests {
             "/api/ui-state",
             "/api/asks",
             "/api/pin-info",
+            "/api/config-files",
         ];
 
         for endpoint in endpoints {
@@ -1189,6 +1561,191 @@ mod tests {
                 .and_then(|value| value.to_str().ok())
                 .is_some_and(|value| value.starts_with("application/json")));
         }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn godui_config_routes_round_trip_editor_workflow() {
+        let _lock = godui_env_test_lock().await;
+        let root = godui_test_root("config-routes");
+        let home = root.join("home");
+        let config_dir = root.join("config");
+        let fleet_dir = config_dir.join("fleet");
+        fs::create_dir_all(&fleet_dir).expect("fleet dir");
+        fs::write(
+            config_dir.join("maw.config.json"),
+            serde_json::to_string_pretty(&json!({
+                "node": "demo",
+                "env": {
+                    "OPENAI_API_KEY": "sk-secret-value",
+                    "SHORT": "ab"
+                }
+            }))
+            .expect("config json"),
+        )
+        .expect("config write");
+        fs::write(fleet_dir.join("01-alpha.json"), r#"{"name":"alpha"}"#).expect("fleet write");
+        let _guards = [
+            EnvGuard::set("HOME", &home.to_string_lossy()),
+            EnvGuard::set("MAW_CONFIG_DIR", &config_dir.to_string_lossy()),
+            EnvGuard::set("MAW_XDG", "1"),
+            EnvGuard::unset("MAW_HOME"),
+        ];
+        let app = godui_test_app();
+
+        let response = godui_request_json(&app, Method::GET, "/api/config-files", "").await;
+        assert_eq!(response["files"][0]["path"], GODUI_CONFIG_FILE);
+        assert!(response["files"].as_array().is_some_and(|files| files
+            .iter()
+            .any(|file| file["path"] == "fleet/01-alpha.json" && file["enabled"] == true)));
+
+        let response = godui_request_json(
+            &app,
+            Method::GET,
+            "/api/config-file?path=maw.config.json",
+            "",
+        )
+        .await;
+        let mut config =
+            serde_json::from_str::<Value>(response["content"].as_str().expect("content"))
+                .expect("display config");
+        let expected_mask = format!("sk-{}", "\u{2022}".repeat(12));
+        assert_eq!(
+            config["env"]["OPENAI_API_KEY"].as_str(),
+            Some(expected_mask.as_str())
+        );
+        assert_eq!(config["env"]["SHORT"], "\u{2022}\u{2022}");
+        config["node"] = Value::String("changed".to_owned());
+        let body = serde_json::to_string(&json!({
+            "content": serde_json::to_string_pretty(&config).expect("save render")
+        }))
+        .expect("save body");
+        let response = godui_request_json(
+            &app,
+            Method::POST,
+            "/api/config-file?path=maw.config.json",
+            &body,
+        )
+        .await;
+        assert_eq!(response["ok"], true);
+        let written = serde_json::from_str::<Value>(
+            &fs::read_to_string(config_dir.join("maw.config.json")).expect("written config"),
+        )
+        .expect("written json");
+        assert_eq!(written["node"], "changed");
+        assert_eq!(written["env"]["OPENAI_API_KEY"], "sk-secret-value");
+        assert_eq!(written["env"]["SHORT"], "ab");
+
+        let response = godui_request_json(
+            &app,
+            Method::PUT,
+            "/api/config-file",
+            r#"{"name":"02-beta.json","content":"{\"name\":\"beta\"}"}"#,
+        )
+        .await;
+        assert_eq!(response["ok"], true);
+        assert_eq!(response["path"], "fleet/02-beta.json");
+
+        let response = godui_request_json(
+            &app,
+            Method::POST,
+            "/api/config-file?path=fleet/02-beta.json",
+            r#"{"content":"{\"name\":\"beta\",\"windows\":[]}"}"#,
+        )
+        .await;
+        assert_eq!(response["ok"], true);
+        assert!(fs::read_to_string(fleet_dir.join("02-beta.json"))
+            .expect("fleet saved")
+            .ends_with('\n'));
+
+        let response = godui_request_json(
+            &app,
+            Method::POST,
+            "/api/config-file/toggle?path=fleet/02-beta.json",
+            "",
+        )
+        .await;
+        assert_eq!(response["ok"], true);
+        assert_eq!(response["newPath"], "fleet/02-beta.json.disabled");
+        assert!(fleet_dir.join("02-beta.json.disabled").exists());
+
+        let response = godui_request_json(
+            &app,
+            Method::DELETE,
+            "/api/config-file?path=fleet/02-beta.json.disabled",
+            "",
+        )
+        .await;
+        assert_eq!(response["ok"], true);
+        assert!(!fleet_dir.join("02-beta.json.disabled").exists());
+
+        let response =
+            godui_request_json(&app, Method::POST, "/api/pin-set", r#"{"pin":"12-3x"}"#).await;
+        assert_eq!(response, json!({"enabled": true, "length": 3, "ok": true}));
+        let written = serde_json::from_str::<Value>(
+            &fs::read_to_string(config_dir.join("maw.config.json")).expect("pin config"),
+        )
+        .expect("pin json");
+        assert_eq!(written["pin"], "123");
+
+        let response =
+            godui_request_json(&app, Method::POST, "/api/pin-set", r#"{"pin":""}"#).await;
+        assert_eq!(response, json!({"enabled": false, "length": 0, "ok": true}));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn godui_config_routes_reject_absolute_fleet_remainders() {
+        let _lock = godui_env_test_lock().await;
+        let root = godui_test_root("config-absolute-remainder");
+        let home = root.join("home");
+        let config_dir = root.join("config");
+        let fleet_dir = config_dir.join("fleet");
+        fs::create_dir_all(&fleet_dir).expect("fleet dir");
+        fs::write(config_dir.join("maw.config.json"), "{}").expect("config write");
+        let victim = root.join("victim.json");
+        fs::write(&victim, r#"{"secret":true}"#).expect("victim write");
+        let _guards = [
+            EnvGuard::set("HOME", &home.to_string_lossy()),
+            EnvGuard::set("MAW_CONFIG_DIR", &config_dir.to_string_lossy()),
+            EnvGuard::set("MAW_XDG", "1"),
+            EnvGuard::unset("MAW_HOME"),
+        ];
+        let decoded_path = format!("fleet/{}", victim.to_string_lossy());
+        assert!(godui_fleet_path_from_request(&decoded_path).is_none());
+        let encoded_path = victim.to_string_lossy().replace('/', "%2F");
+        let config_uri = format!("/api/config-file?path=fleet%2F{encoded_path}");
+        let toggle_uri = format!("/api/config-file/toggle?path=fleet%2F{encoded_path}");
+        let app = godui_test_app();
+
+        assert_eq!(
+            godui_request_status(&app, Method::GET, &config_uri, "").await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            godui_request_status(
+                &app,
+                Method::POST,
+                &config_uri,
+                r#"{"content":"{\"changed\":true}"}"#
+            )
+            .await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            godui_request_status(&app, Method::DELETE, &config_uri, "").await,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            godui_request_status(&app, Method::POST, &toggle_uri, "").await,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            fs::read_to_string(&victim).expect("victim unchanged"),
+            r#"{"secret":true}"#
+        );
+        assert!(!root.join("victim.json.disabled").exists());
+        fs::remove_dir_all(root).ok();
     }
 
     #[tokio::test]
@@ -1237,6 +1794,64 @@ mod tests {
             std::env::remove_var("MAW_GODUI_STATE_DIR");
         }
         fs::remove_dir_all(root).ok();
+    }
+
+    async fn godui_env_test_lock() -> tokio::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await
+    }
+
+    fn godui_test_app() -> Router {
+        let router = servecore_mount_core_routes(Router::new());
+        let router = servecore_mount_modules(router, &["god-ui".to_owned()]);
+        let router = servecore_with_shared_state(router, ServecoreSharedState::default());
+        servecore_apply_pipeline(router)
+    }
+
+    async fn godui_request_json(app: &Router, method: Method, uri: &str, body: &str) -> Value {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_owned()))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert!(
+            response.status().is_success(),
+            "{uri} returned {}",
+            response.status()
+        );
+        let body = to_bytes(response.into_body(), GODUI_POST_BODY_LIMIT)
+            .await
+            .expect("response body");
+        serde_json::from_slice(&body).expect("response json")
+    }
+
+    async fn godui_request_status(
+        app: &Router,
+        method: Method,
+        uri: &str,
+        body: &str,
+    ) -> StatusCode {
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_owned()))
+                    .expect("request"),
+            )
+            .await
+            .expect("response")
+            .status()
     }
 
     fn godui_test_root(name: &str) -> PathBuf {

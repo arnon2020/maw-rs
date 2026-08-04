@@ -422,7 +422,7 @@ fn config_is_secret_key(key: &str) -> bool {
         || lower.contains("key")
 }
 
-fn config_read_target() -> Result<serde_json::Value, String> {
+pub(crate) fn config_read_target() -> Result<serde_json::Value, String> {
     let path = config_target_path();
     if !path.exists() {
         return Ok(serde_json::json!({}));
@@ -433,7 +433,7 @@ fn config_read_target() -> Result<serde_json::Value, String> {
         .map_err(|error| format!("maw config: failed to parse config JSON: {error}"))
 }
 
-fn config_target_path() -> std::path::PathBuf {
+pub(crate) fn config_target_path() -> std::path::PathBuf {
     let env = current_xdg_env();
     let weighted = maw_config_path(&env, &["maw.config.50.json"]);
     if weighted.exists() {
@@ -443,7 +443,7 @@ fn config_target_path() -> std::path::PathBuf {
     }
 }
 
-fn config_atomic_write(path: &std::path::Path, body: &str) -> Result<(), String> {
+pub(crate) fn config_atomic_write(path: &std::path::Path, body: &str) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|error| format!("maw config: failed to create config dir: {error}"))?;
