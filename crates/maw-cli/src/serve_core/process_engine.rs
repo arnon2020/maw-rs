@@ -75,6 +75,13 @@ impl ServecoreExecRunner for ServecoreProcessRunner {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ServeengineRestartTarget {
+    interrupt: String,
+    wake: String,
+    parent: Option<String>,
+}
+
 fn serveengine_child_timeout() -> Duration {
     std::env::var(SERVEENGINE_CHILD_TIMEOUT_ENV)
         .ok()
@@ -290,25 +297,81 @@ fn serveengine_ws_restart_with_sleep(
     runner: &dyn ServecoreExecRunner,
     mut sleep: impl FnMut(Duration),
 ) -> Result<String, String> {
+    serveengine_ws_restart_with_hooks(
+        value,
+        fallback_target,
+        runner,
+        &mut sleep,
+        serveengine_resolve_restart_target,
+    )
+}
+
+fn serveengine_ws_restart_with_hooks(
+    value: &serde_json::Value,
+    fallback_target: Option<&str>,
+    runner: &dyn ServecoreExecRunner,
+    mut sleep: impl FnMut(Duration),
+    mut resolve_restart_target: impl FnMut(&str) -> ServeengineRestartTarget,
+) -> Result<String, String> {
     let target = serveengine_ws_target(value, fallback_target)?;
-    let interrupt_target = serveengine_resolve_tmux_command_target(&target);
-    serveengine_tmux_send_interrupt(&interrupt_target)?;
+    let restart_target = resolve_restart_target(&target);
+    serveengine_tmux_send_interrupt(&restart_target.interrupt)?;
     sleep(Duration::from_secs(2));
-    serveengine_tmux_send_interrupt(&interrupt_target)?;
+    serveengine_tmux_send_interrupt(&restart_target.interrupt)?;
     sleep(Duration::from_millis(500));
-    let argv = serveengine_wake_argv(value, &target);
+    let argv = serveengine_restart_wake_argv(value, &restart_target);
     let cwd = std::env::current_dir()
         .map_err(|error| format!("serve-ws: current_dir failed: {error}"))?;
     runner.servecore_run(&argv, &cwd)?;
     Ok(target)
 }
 
-fn serveengine_resolve_tmux_command_target(target: &str) -> String {
+fn serveengine_resolve_restart_target(target: &str) -> ServeengineRestartTarget {
     if std::env::var_os(SERVEENGINE_FAKE_TMUX_LOG_ENV).is_some() {
-        return target.to_owned();
+        return ServeengineRestartTarget {
+            interrupt: target.to_owned(),
+            wake: target.to_owned(),
+            parent: None,
+        };
     }
     let mut tmux = maw_tmux::TmuxClient::local();
-    serveengine_resolve_capture_target(target, &tmux.list_all())
+    let sessions = tmux.list_all();
+    let interrupt = serveengine_resolve_capture_target(target, &sessions);
+    let (wake, parent) = serveengine_wake_target_from_resolved_tmux_target(&interrupt, &sessions);
+    ServeengineRestartTarget {
+        interrupt,
+        wake,
+        parent,
+    }
+}
+
+fn serveengine_wake_target_from_resolved_tmux_target(
+    target: &str,
+    sessions: &[TmuxSession],
+) -> (String, Option<String>) {
+    let Some((session_name, window_part)) = target.split_once(':') else {
+        return (target.to_owned(), None);
+    };
+    let window_part = window_part
+        .split_once('.')
+        .map_or(window_part, |(window, _pane)| window);
+    let Some(session) = sessions.iter().find(|session| session.name == session_name) else {
+        return (target.to_owned(), None);
+    };
+    let window = window_part
+        .parse::<u32>()
+        .ok()
+        .and_then(|index| session.windows.iter().find(|window| window.index == index));
+    let window = window.or_else(|| {
+        session
+            .windows
+            .iter()
+            .find(|window| window.name == window_part)
+    });
+    window.map_or_else(
+        || (target.to_owned(), None),
+        |window| (window.name.clone(), Some(session_name.to_owned())),
+    )
 }
 
 fn serveengine_wake_argv(value: &serde_json::Value, target: &str) -> Vec<String> {
@@ -320,6 +383,17 @@ fn serveengine_wake_argv(value: &serde_json::Value, target: &str) -> Vec<String>
     ];
     if let Some(command) = value.get("command").and_then(serde_json::Value::as_str) {
         argv.extend(["--engine".to_owned(), command.to_owned()]);
+    }
+    argv
+}
+
+fn serveengine_restart_wake_argv(
+    value: &serde_json::Value,
+    target: &ServeengineRestartTarget,
+) -> Vec<String> {
+    let mut argv = serveengine_wake_argv(value, &target.wake);
+    if let Some(parent) = &target.parent {
+        argv.extend(["--parent".to_owned(), parent.clone()]);
     }
     argv
 }
@@ -1143,6 +1217,70 @@ printf '{{"cwd":"%s","argv":["%s","%s","%s","%s"]}}' "$(pwd)" "$1" "$2" "$3" "$4
     }
 
     #[test]
+    fn serveengine_native_ws_restart_wakes_the_resolved_window_target() {
+        let _lock = fake_tmux_log_lock().lock().expect("lock");
+        let root = temp_dir("ws-restart-resolved");
+        let log = root.join("tmux.jsonl");
+        let _guard = EnvGuard::set_path(SERVEENGINE_FAKE_TMUX_LOG_ENV, &log);
+        let runner = FakeRunner::default();
+        let value = serde_json::json!({
+            "type": "restart",
+            "target": "rpro-ent-codex-1",
+            "command": "claude",
+        });
+        let mut sleeps = Vec::new();
+
+        let target = serveengine_ws_restart_with_hooks(
+            &value,
+            None,
+            &runner,
+            |delay| sleeps.push(delay),
+            |raw| {
+                assert_eq!(raw, "rpro-ent-codex-1");
+                ServeengineRestartTarget {
+                    interrupt: "05-rpro-ent:2".to_owned(),
+                    wake: "rpro-ent-codex-1".to_owned(),
+                    parent: Some("05-rpro-ent".to_owned()),
+                }
+            },
+        )
+        .expect("restart");
+
+        assert_eq!(target, "rpro-ent-codex-1");
+        assert_eq!(
+            sleeps,
+            vec![Duration::from_secs(2), Duration::from_millis(500)]
+        );
+        let log = fs::read_to_string(log).expect("tmux log");
+        let events = log
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("json"))
+            .collect::<Vec<_>>();
+        assert_eq!(events.len(), 2);
+        assert!(events
+            .iter()
+            .all(|event| event["args"][1] == "05-rpro-ent:2"));
+        let calls = runner
+            .calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(
+            calls[0].0,
+            vec![
+                "wake",
+                "rpro-ent-codex-1",
+                "--no-attach",
+                "--yes",
+                "--engine",
+                "claude",
+                "--parent",
+                "05-rpro-ent",
+            ]
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn serveengine_native_ws_sleep_and_stop_reject_bad_target() {
         let engine = ServecoreNativeEngine;
 
@@ -1200,6 +1338,30 @@ printf '{{"cwd":"%s","argv":["%s","%s","%s","%s"]}}' "$(pwd)" "$1" "$2" "$3" "$4
         assert_eq!(
             serveengine_resolve_capture_target("fable-codex-2", &sessions),
             "35-fable-learn-speckit:2"
+        );
+    }
+
+    #[test]
+    fn serveengine_restart_wake_target_maps_resolved_window_index_to_name() {
+        let sessions = vec![TmuxSession {
+            name: "05-rpro-ent".to_owned(),
+            windows: vec![maw_tmux::TmuxWindow {
+                index: 2,
+                name: "rpro-ent-codex-1".to_owned(),
+                active: false,
+                cwd: None,
+            }],
+        }];
+
+        let resolved = serveengine_resolve_capture_target("rpro-ent-codex-1", &sessions);
+
+        assert_eq!(resolved, "05-rpro-ent:2");
+        assert_eq!(
+            serveengine_wake_target_from_resolved_tmux_target(&resolved, &sessions),
+            (
+                "rpro-ent-codex-1".to_owned(),
+                Some("05-rpro-ent".to_owned())
+            )
         );
     }
 }
