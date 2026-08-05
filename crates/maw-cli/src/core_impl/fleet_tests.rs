@@ -308,12 +308,19 @@ mod fleet_tests {
             let findings = dry_json["findings"].as_array().expect("findings");
             // The original alias-based dedup check must stay silent: these
             // are genuinely distinct windows, not the same window under two
-            // names. It's a *different* claim from "wake maw-rs resolves" --
-            // none of the three is literally named maw-rs, so that oracle
-            // identity IS genuinely ambiguous (#711) and doctor should say so.
+            // names.
             assert!(!findings.iter().any(|finding| finding["code"] == "duplicate-window-repo"), "{dry_json}");
+            // `41-team` is a FOREIGN session: its stem is not maw-rs and no
+            // window is named maw-rs, so none of the three speaks for that
+            // oracle any more (`wake_window_speaks_for_oracle`). `wake maw-rs`
+            // is therefore no longer ambiguous -- it falls through to the repo
+            // path and wakes maw-rs' own window -- so doctor has nothing to
+            // report. It still reports the real #711 shape, where the siblings
+            // sit in the ORACLE'S OWN session (see
+            // fleet_doctor_flags_oracle_names_that_resolve_to_multiple_registry_windows,
+            // `09-twin` on acme/twin-oracle, which still fires).
             assert!(
-                findings.iter().any(|finding| finding["code"] == "ambiguous-oracle" && finding["subject"] == "maw-rs"),
+                !findings.iter().any(|finding| finding["code"] == "ambiguous-oracle" && finding["subject"] == "maw-rs"),
                 "{dry_json}"
             );
 

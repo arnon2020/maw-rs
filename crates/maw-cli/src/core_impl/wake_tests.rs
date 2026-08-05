@@ -65,6 +65,108 @@ mod wake_tests {
         assert!(error.contains("ambiguous"), "{error}");
     }
 
+    fn lao_index_fleet_entry() -> NativeFleetEntry {
+        // The summon-holmes repro, verbatim from ~/.maw/fleet/lao-index.json:
+        // holmes spawned a worker for a research case, named the window
+        // `scout-oracle`, and ran it inside holmes' OWN repo. maw
+        // auto-registered it -- so the only registry window on
+        // `arnon2020/holmes-oracle` was a worker that answered to `holmes`.
+        NativeFleetEntry {
+            file: "lao-index.json".to_owned(),
+            path: std::path::PathBuf::from("lao-index.json"),
+            session: NativeFleetSession {
+                name: "lao-index".to_owned(),
+                windows: vec![NativeFleetWindow {
+                    name: "scout-oracle".to_owned(),
+                    repo: "arnon2020/holmes-oracle".to_owned(),
+                    kind: None,
+                }],
+                ..NativeFleetSession::default()
+            },
+        }
+    }
+
+    #[test]
+    fn wake_registry_target_does_not_hand_an_oracle_name_to_a_foreign_session_worker() {
+        // `maw wake holmes` used to resolve to `lao-index:scout-oracle` --
+        // one candidate, so no tiebreak and no ambiguity error, just the
+        // wrong agent waking up (and with `--continue`, resuming the
+        // worker's own thread). The registry must decline it entirely so
+        // resolution falls through to the repo path and wakes holmes.
+        let entries = vec![lao_index_fleet_entry()];
+
+        let resolved = wake_resolve_registry_target("holmes", &entries, &[])
+            .expect("a foreign-session worker must not be an error either -- just not a match");
+
+        assert!(resolved.is_none(), "{resolved:?}");
+    }
+
+    #[test]
+    fn wake_registry_aliases_drop_borrowed_identity_but_keep_the_workers_own_name() {
+        // Declining the borrowed identity must not orphan the worker: it
+        // keeps its literal window name, so `maw wake scout-oracle` (and
+        // `lao-index:scout-oracle`) still reach it.
+        let entry = lao_index_fleet_entry();
+        let worker = &entry.session.windows[0];
+
+        let aliases = wake_registry_aliases(worker, &entry.session.name, "holmes");
+
+        assert_eq!(aliases, vec!["scout-oracle".to_owned()]);
+    }
+
+    #[test]
+    fn wake_session_detection_ignores_a_foreign_session_parked_in_the_oracles_repo() {
+        // Declining the alias is only half of it: session detection matches on
+        // the recorded REPO, so `lao-index` would still have been chosen as
+        // holmes' home and the correctly-named window would open inside the
+        // worker's team session. The oracle gets its own session instead.
+        let entries = vec![lao_index_fleet_entry()];
+        let repo = native_fleet_repo_path("arnon2020/holmes-oracle").expect("repo path");
+
+        let session = wake_detect_session_from_fleet_registry("holmes", &repo, &entries);
+
+        assert_eq!(session, None);
+    }
+
+    #[test]
+    fn wake_session_detection_keeps_the_oracles_own_registry_session() {
+        // The positive control for the check above: a window that does speak
+        // for the oracle still pins its session, so a normal wake keeps
+        // landing in the session the registry already records.
+        let entries = vec![NativeFleetEntry {
+            file: "18-holmes.json".to_owned(),
+            path: std::path::PathBuf::from("18-holmes.json"),
+            session: NativeFleetSession {
+                name: "18-holmes".to_owned(),
+                windows: vec![NativeFleetWindow {
+                    name: "holmes-oracle".to_owned(),
+                    repo: "arnon2020/holmes-oracle".to_owned(),
+                    kind: None,
+                }],
+                ..NativeFleetSession::default()
+            },
+        }];
+        let repo = native_fleet_repo_path("arnon2020/holmes-oracle").expect("repo path");
+
+        let session = wake_detect_session_from_fleet_registry("holmes", &repo, &entries);
+
+        assert_eq!(session.as_deref(), Some("18-holmes"));
+    }
+
+    #[test]
+    fn wake_registry_aliases_keep_repo_identity_inside_the_oracles_own_session() {
+        // #711's fan-out siblings live in the oracle's own session and must
+        // keep speaking for it -- that is what makes the bare stem correctly
+        // ambiguous rather than silently picking one of seven.
+        let entry = rpro_ent_fleet_entry();
+        let sibling = &entry.session.windows[1];
+
+        let aliases = wake_registry_aliases(sibling, &entry.session.name, "rpro-ent");
+
+        assert_eq!(sibling.name, "rpro-ent-codex-1");
+        assert!(aliases.contains(&"rpro-ent".to_owned()), "{aliases:?}");
+    }
+
     #[test]
     fn wake_primary_registry_window_keeps_bare_stem_fallback_without_oracle_window() {
         let window = |name: &str| NativeFleetWindow {

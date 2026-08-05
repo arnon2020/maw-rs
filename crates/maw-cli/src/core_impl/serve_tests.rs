@@ -310,6 +310,7 @@ mod serve_tests {
     struct FakeServeWake {
         wakes: Mutex<Vec<(String, Option<String>)>>,
         error: Mutex<Option<String>>,
+        resolved: Mutex<Option<String>>,
     }
 
     impl FakeServeWake {
@@ -319,6 +320,10 @@ mod serve_tests {
 
         fn wakes(&self) -> Vec<(String, Option<String>)> {
             self.wakes.lock().expect("wakes").clone()
+        }
+
+        fn set_resolved(&self, resolved: &str) {
+            *self.resolved.lock().expect("wake resolved") = Some(resolved.to_owned());
         }
     }
 
@@ -332,6 +337,10 @@ mod serve_tests {
                 .expect("wakes")
                 .push((target.to_owned(), task.map(ToOwned::to_owned)));
             Ok(format!("woke {target}\n"))
+        }
+
+        fn resolved_target(&self, _target: &str) -> Option<String> {
+            self.resolved.lock().expect("wake resolved").clone()
         }
     }
 
@@ -785,6 +794,25 @@ mod serve_tests {
             wake.wakes(),
             vec![("capture-agent".to_owned(), Some("fix issue".to_owned()))]
         );
+    }
+
+    #[tokio::test]
+    async fn serve_wake_reports_the_session_window_it_resolved_to() {
+        // The caller asked for a name; the answer says which window that name
+        // actually lands on. A UI summon has no other way to notice that a
+        // registry window borrowed the oracle's identity.
+        let wake = Arc::new(FakeServeWake::default());
+        wake.set_resolved("lao-index:scout-oracle");
+        let app = serve_test_app_with_wake(serve_test_trust_store_path("wake-resolved"), wake.clone());
+        let body = r#"{"target":"holmes"}"#;
+        let response = app
+            .oneshot(signed_json_request("POST", "/api/wake", body, KEY, FROM, 1_782_277_200))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["target"], "holmes");
+        assert_eq!(json["resolved"], "lao-index:scout-oracle");
     }
 
     #[tokio::test]
