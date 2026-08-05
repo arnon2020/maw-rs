@@ -1763,6 +1763,12 @@ async fn servecore_ws_stream(
         state.engine.servecore_ws_close(kind, target.as_deref());
         return;
     }
+    if matches!(kind, ServecoreWsKind::Tmux) {
+        process_engine::serveengine_ws_tmux_stream(socket, state.clone(), target.clone(), &config)
+            .await;
+        state.engine.servecore_ws_close(kind, target.as_deref());
+        return;
+    }
     let mut heartbeat = tokio::time::interval_at(
         tokio::time::Instant::now() + config.heartbeat_interval,
         config.heartbeat_interval,
@@ -3039,9 +3045,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn servecore_ws_uses_engine_hook_and_loopback_auth() {
+    async fn servecore_ws_opens_tmux_route_and_loopback_auth() {
         let engine = Arc::new(TestEngine::default());
-        let state = ServecoreSharedState::default().servecore_with_engine(engine.clone());
+        let state = ServecoreSharedState::default()
+            .servecore_with_engine(engine.clone())
+            .servecore_with_tmux_sessions_snapshot(vec![TmuxSession {
+                name: "142-athena".to_owned(),
+                windows: Vec::new(),
+            }]);
         let addr =
             servecore_spawn_ws_test_server(state, modules::websocket_routes::WsConfig::default())
                 .await;
@@ -3049,18 +3060,8 @@ mod tests {
         let (mut ws, _response) = tokio_tungstenite::connect_async(&url)
             .await
             .expect("connect websocket");
-        ws.send(tokio_tungstenite::tungstenite::Message::Text(
-            "hello".to_owned(),
-        ))
-        .await
-        .expect("send");
-        loop {
-            let received = ws.next().await.expect("frame").expect("frame ok");
-            if let tokio_tungstenite::tungstenite::Message::Text(text) = received {
-                assert_eq!(text, "Tmux:nova:1.0:hello");
-                break;
-            }
-        }
+        let frame = servecore_next_ws_json_type(&mut ws, "sessions").await;
+        assert_eq!(frame["sessions"][0]["name"], "142-athena");
         assert_eq!(
             engine
                 .opened
@@ -3079,6 +3080,79 @@ mod tests {
             .await
             .expect("protected");
         assert_eq!(protected.status(), StatusCode::OK);
+        ws.close(None).await.expect("close ws");
+    }
+
+    #[tokio::test]
+    async fn servecore_ws_tmux_streams_initial_refresh_and_periodic_sessions() {
+        let state = ServecoreSharedState::default().servecore_with_tmux_sessions_snapshot(vec![
+            TmuxSession {
+                name: "142-athena".to_owned(),
+                windows: vec![maw_tmux::TmuxWindow {
+                    index: 1,
+                    name: "athena-oracle".to_owned(),
+                    active: true,
+                    cwd: Some("/opt/athena".to_owned()),
+                }],
+            },
+        ]);
+        let addr = servecore_spawn_ws_test_server(
+            state,
+            modules::websocket_routes::WsConfig {
+                idle_timeout: Duration::from_secs(5),
+                heartbeat_interval: Duration::from_secs(5),
+                capture_interval: Duration::from_millis(100),
+                previews_interval: Duration::from_secs(2),
+                send_timeout: Duration::from_secs(2),
+                max_frame_bytes: 1024,
+                max_connections: 8,
+            },
+        )
+        .await;
+        let (mut ws, _response) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws/tmux"))
+            .await
+            .expect("connect tmux websocket");
+
+        let initial = servecore_next_ws_json_type(&mut ws, "sessions").await;
+        assert_eq!(initial["sessions"][0]["name"], "142-athena");
+
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            "refresh".to_owned(),
+        ))
+        .await
+        .expect("refresh");
+        let refreshed = servecore_next_ws_json_type(&mut ws, "sessions").await;
+        assert_eq!(
+            refreshed["sessions"][0]["windows"][0]["name"],
+            "athena-oracle"
+        );
+
+        let periodic = servecore_next_ws_json_type(&mut ws, "sessions").await;
+        assert_eq!(periodic["sessions"][0]["windows"][0]["cwd"], "/opt/athena");
+        ws.close(None).await.expect("close ws");
+    }
+
+    async fn servecore_next_ws_json_type<S>(
+        ws: &mut tokio_tungstenite::WebSocketStream<S>,
+        expected_type: &str,
+    ) -> serde_json::Value
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let received = ws.next().await.expect("frame").expect("frame ok");
+                if let tokio_tungstenite::tungstenite::Message::Text(text) = received {
+                    let value =
+                        serde_json::from_str::<serde_json::Value>(&text).expect("json frame");
+                    if value["type"] == expected_type {
+                        break value;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("expected websocket frame")
     }
 
     #[tokio::test]

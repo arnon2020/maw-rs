@@ -8,8 +8,12 @@ use std::{
 };
 
 use super::{
-    modules::websocket_routes::{ws_validate_target, WsConfig},
-    servecore_ws_send, ServecoreEngine, ServecoreSharedState, ServecoreWsKind,
+    modules::{
+        god_mode_ui::godui_ws_session_recent_frames,
+        websocket_routes::{ws_validate_target, WsConfig},
+    },
+    servecore_ws_send, servecore_ws_send_text_frames, ServecoreEngine, ServecoreSharedState,
+    ServecoreWsKind,
 };
 use axum::extract::ws::{Message, WebSocket};
 use maw_routing::{
@@ -234,6 +238,16 @@ fn serveengine_ws_text(text: &str, fallback_target: Option<&str>) -> String {
                 Err(error) => serveengine_ws_error(&error),
             }
         }
+        Some("wake") => serveengine_ws_wake(&value, fallback_target, &ServecoreProcessRunner)
+            .map_or_else(
+                |error| serveengine_ws_error(&error),
+                |target| serveengine_woke_reply(&target),
+            ),
+        Some("restart") => serveengine_ws_restart(&value, fallback_target, &ServecoreProcessRunner)
+            .map_or_else(
+                |error| serveengine_ws_error(&error),
+                |target| serveengine_restarted_reply(&target),
+            ),
         Some("stop") => {
             let target = match serveengine_ws_target(&value, fallback_target) {
                 Ok(target) => target,
@@ -247,6 +261,75 @@ fn serveengine_ws_text(text: &str, fallback_target: Option<&str>) -> String {
         Some(_) => serveengine_ws_error("unsupported_message"),
         None => serveengine_ws_error("missing_type"),
     }
+}
+
+fn serveengine_ws_wake(
+    value: &serde_json::Value,
+    fallback_target: Option<&str>,
+    runner: &dyn ServecoreExecRunner,
+) -> Result<String, String> {
+    let target = serveengine_ws_target(value, fallback_target)?;
+    let argv = serveengine_wake_argv(value, &target);
+    let cwd = std::env::current_dir()
+        .map_err(|error| format!("serve-ws: current_dir failed: {error}"))?;
+    runner.servecore_run(&argv, &cwd)?;
+    Ok(target)
+}
+
+fn serveengine_ws_restart(
+    value: &serde_json::Value,
+    fallback_target: Option<&str>,
+    runner: &dyn ServecoreExecRunner,
+) -> Result<String, String> {
+    serveengine_ws_restart_with_sleep(value, fallback_target, runner, std::thread::sleep)
+}
+
+fn serveengine_ws_restart_with_sleep(
+    value: &serde_json::Value,
+    fallback_target: Option<&str>,
+    runner: &dyn ServecoreExecRunner,
+    mut sleep: impl FnMut(Duration),
+) -> Result<String, String> {
+    let target = serveengine_ws_target(value, fallback_target)?;
+    let interrupt_target = serveengine_resolve_tmux_command_target(&target);
+    serveengine_tmux_send_interrupt(&interrupt_target)?;
+    sleep(Duration::from_secs(2));
+    serveengine_tmux_send_interrupt(&interrupt_target)?;
+    sleep(Duration::from_millis(500));
+    let argv = serveengine_wake_argv(value, &target);
+    let cwd = std::env::current_dir()
+        .map_err(|error| format!("serve-ws: current_dir failed: {error}"))?;
+    runner.servecore_run(&argv, &cwd)?;
+    Ok(target)
+}
+
+fn serveengine_resolve_tmux_command_target(target: &str) -> String {
+    if std::env::var_os(SERVEENGINE_FAKE_TMUX_LOG_ENV).is_some() {
+        return target.to_owned();
+    }
+    let mut tmux = maw_tmux::TmuxClient::local();
+    serveengine_resolve_capture_target(target, &tmux.list_all())
+}
+
+fn serveengine_wake_argv(value: &serde_json::Value, target: &str) -> Vec<String> {
+    let mut argv = vec![
+        "wake".to_owned(),
+        target.to_owned(),
+        "--no-attach".to_owned(),
+        "--yes".to_owned(),
+    ];
+    if let Some(command) = value.get("command").and_then(serde_json::Value::as_str) {
+        argv.extend(["--engine".to_owned(), command.to_owned()]);
+    }
+    argv
+}
+
+fn serveengine_woke_reply(target: &str) -> String {
+    serde_json::json!({"type":"woke","target":target}).to_string()
+}
+
+fn serveengine_restarted_reply(target: &str) -> String {
+    serde_json::json!({"type":"restarted","target":target}).to_string()
 }
 
 fn serveengine_ws_target(
@@ -278,6 +361,14 @@ fn serveengine_tmux_send(target: &str, text: &str, enter: bool) -> Result<(), St
     Ok(())
 }
 
+fn serveengine_tmux_send_interrupt(target: &str) -> Result<(), String> {
+    serveengine_tmux_run(
+        "send-keys",
+        &["-t".to_owned(), target.to_owned(), "C-c".to_owned()],
+    )
+    .map(|_| ())
+}
+
 fn serveengine_tmux_run(subcommand: &str, args: &[String]) -> Result<String, String> {
     if let Some(log) = std::env::var_os(SERVEENGINE_FAKE_TMUX_LOG_ENV).map(PathBuf::from) {
         let mut body = std::fs::read_to_string(&log).unwrap_or_default();
@@ -293,6 +384,138 @@ fn serveengine_tmux_run(subcommand: &str, args: &[String]) -> Result<String, Str
 
 fn serveengine_ws_error(error: &str) -> String {
     serde_json::json!({"type":"error","error":error}).to_string()
+}
+
+pub(crate) async fn serveengine_ws_tmux_stream(
+    mut socket: WebSocket,
+    state: Arc<ServecoreSharedState>,
+    fallback_target: Option<String>,
+    config: &WsConfig,
+) {
+    if !serveengine_ws_tmux_push(&mut socket, &state, fallback_target.as_deref(), config).await {
+        return;
+    }
+    let mut heartbeat = tokio::time::interval_at(
+        tokio::time::Instant::now() + config.heartbeat_interval,
+        config.heartbeat_interval,
+    );
+    let mut capture_tick = tokio::time::interval_at(
+        tokio::time::Instant::now() + config.capture_interval,
+        config.capture_interval,
+    );
+    let idle_timer = tokio::time::sleep(config.idle_timeout);
+    tokio::pin!(idle_timer);
+    loop {
+        tokio::select! {
+            _ = capture_tick.tick() => {
+                if !serveengine_ws_tmux_push(&mut socket, &state, fallback_target.as_deref(), config).await {
+                    break;
+                }
+                idle_timer.as_mut().reset(tokio::time::Instant::now() + config.idle_timeout);
+            }
+            _ = heartbeat.tick() => {
+                if servecore_ws_send(&mut socket, Message::Ping(Vec::new()), config.send_timeout).await.is_err() {
+                    break;
+                }
+            }
+            () = &mut idle_timer => {
+                let _ = servecore_ws_send(&mut socket, Message::Close(None), config.send_timeout).await;
+                break;
+            }
+            frame = socket.recv() => match frame {
+                Some(Ok(frame)) => {
+                    let resets_idle = !matches!(frame, Message::Pong(_));
+                    if resets_idle {
+                        idle_timer.as_mut().reset(tokio::time::Instant::now() + config.idle_timeout);
+                    }
+                    if !serveengine_ws_tmux_frame(&mut socket, &state, fallback_target.as_deref(), config, frame).await {
+                        break;
+                    }
+                }
+                Some(Err(_)) | None => break,
+            }
+        }
+    }
+}
+
+async fn serveengine_ws_tmux_frame(
+    socket: &mut WebSocket,
+    state: &ServecoreSharedState,
+    fallback_target: Option<&str>,
+    config: &WsConfig,
+    frame: Message,
+) -> bool {
+    match frame {
+        Message::Text(text) => {
+            if text.len() > config.max_frame_bytes {
+                return false;
+            }
+            if serveengine_ws_tmux_is_refresh(&text) {
+                serveengine_ws_tmux_push(socket, state, fallback_target, config).await
+            } else {
+                servecore_ws_send(
+                    socket,
+                    Message::Text(serveengine_ws_error("unsupported_message")),
+                    config.send_timeout,
+                )
+                .await
+                .is_ok()
+            }
+        }
+        Message::Binary(bytes) => bytes.len() <= config.max_frame_bytes,
+        Message::Ping(bytes) => {
+            servecore_ws_send(socket, Message::Pong(bytes), config.send_timeout)
+                .await
+                .is_ok()
+        }
+        Message::Pong(_) => true,
+        Message::Close(frame) => {
+            let _ = servecore_ws_send(socket, Message::Close(frame), config.send_timeout).await;
+            false
+        }
+    }
+}
+
+fn serveengine_ws_tmux_is_refresh(text: &str) -> bool {
+    if text == "refresh" {
+        return true;
+    }
+    serde_json::from_str::<serde_json::Value>(text)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .map(|kind| kind == "refresh")
+        })
+        .unwrap_or(false)
+}
+
+async fn serveengine_ws_tmux_push(
+    socket: &mut WebSocket,
+    state: &ServecoreSharedState,
+    fallback_target: Option<&str>,
+    config: &WsConfig,
+) -> bool {
+    let frames = serveengine_ws_tmux_frames(state, fallback_target);
+    servecore_ws_send_text_frames(socket, frames, config).await
+}
+
+fn serveengine_ws_tmux_frames(
+    state: &ServecoreSharedState,
+    fallback_target: Option<&str>,
+) -> Vec<String> {
+    let mut frames = godui_ws_session_recent_frames(state.servecore_tmux_sessions());
+    if let Some(target) = fallback_target {
+        let frame = match serveengine_tmux_capture(target) {
+            Ok(content) => {
+                serde_json::json!({"type":"capture","target":target,"content":content}).to_string()
+            }
+            Err(error) => serde_json::json!({"type":"error","error":error}).to_string(),
+        };
+        frames.push(frame);
+    }
+    frames
 }
 
 pub(crate) async fn serveengine_ws_pty_stream(
@@ -668,6 +891,21 @@ mod tests {
         path
     }
 
+    #[derive(Default)]
+    struct FakeRunner {
+        calls: Mutex<Vec<(Vec<String>, PathBuf)>>,
+    }
+
+    impl ServecoreExecRunner for FakeRunner {
+        fn servecore_run(&self, argv: &[String], cwd: &Path) -> Result<(), String> {
+            self.calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((argv.to_vec(), cwd.to_path_buf()));
+            Ok(())
+        }
+    }
+
     #[test]
     fn serveengine_self_bin_uses_env() {
         let root = temp_dir("self-bin");
@@ -819,6 +1057,88 @@ printf '{{"cwd":"%s","argv":["%s","%s","%s","%s"]}}' "$(pwd)" "$1" "$2" "$3" "$4
         assert!(log.contains(r#""send-keys""#));
         assert!(log.contains(r#""C-c""#));
         assert!(log.contains(r#""kill-window""#));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn serveengine_native_ws_wake_uses_self_runner_and_engine_flag() {
+        let runner = FakeRunner::default();
+        let value = serde_json::json!({
+            "type": "wake",
+            "target": "demo:1",
+            "command": "codex",
+        });
+
+        let target = serveengine_ws_wake(&value, None, &runner).expect("wake");
+
+        assert_eq!(target, "demo:1");
+        let calls = runner
+            .calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].0,
+            vec![
+                "wake",
+                "demo:1",
+                "--no-attach",
+                "--yes",
+                "--engine",
+                "codex",
+            ]
+        );
+        assert!(calls[0].1.is_dir());
+    }
+
+    #[test]
+    fn serveengine_native_ws_restart_interrupts_twice_then_wakes() {
+        let _lock = fake_tmux_log_lock().lock().expect("lock");
+        let root = temp_dir("ws-restart");
+        let log = root.join("tmux.jsonl");
+        let _guard = EnvGuard::set_path(SERVEENGINE_FAKE_TMUX_LOG_ENV, &log);
+        let runner = FakeRunner::default();
+        let value = serde_json::json!({
+            "type": "restart",
+            "target": "demo:1",
+            "command": "claude",
+        });
+        let mut sleeps = Vec::new();
+
+        let target =
+            serveengine_ws_restart_with_sleep(&value, None, &runner, |delay| sleeps.push(delay))
+                .expect("restart");
+
+        assert_eq!(target, "demo:1");
+        assert_eq!(
+            sleeps,
+            vec![Duration::from_secs(2), Duration::from_millis(500)]
+        );
+        let log = fs::read_to_string(log).expect("tmux log");
+        let events = log
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("json"))
+            .collect::<Vec<_>>();
+        assert_eq!(events.len(), 2);
+        assert!(events
+            .iter()
+            .all(|event| event["subcommand"] == "send-keys"));
+        assert!(events.iter().all(|event| event["args"][2] == "C-c"));
+        let calls = runner
+            .calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(
+            calls[0].0,
+            vec![
+                "wake",
+                "demo:1",
+                "--no-attach",
+                "--yes",
+                "--engine",
+                "claude",
+            ]
+        );
         fs::remove_dir_all(root).ok();
     }
 
