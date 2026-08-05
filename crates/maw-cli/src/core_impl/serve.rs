@@ -97,6 +97,13 @@ struct ServeSystemDelivery;
 
 trait ServeWakeExecutor: Send + Sync {
     fn execute_wake(&self, target: &str, task: Option<&str>) -> Result<String, String>;
+
+    /// The `session:window` this wake will land on, echoed back to the caller
+    /// so a UI summon can show WHO woke up, not just that a wake was sent.
+    /// Defaults to `None` so test doubles stay unaffected.
+    fn resolved_target(&self, _target: &str) -> Option<String> {
+        None
+    }
 }
 
 struct ServeSystemWakeExecutor;
@@ -123,6 +130,10 @@ impl ServeWakeExecutor for ServeSystemWakeExecutor {
         let detail = if stderr.is_empty() { output.stdout.trim() } else { stderr };
         let detail = if detail.is_empty() { "wake failed" } else { detail };
         Err(format!("wake exited {}: {detail}", output.code))
+    }
+
+    fn resolved_target(&self, target: &str) -> Option<String> {
+        wake_resolved_target(target, &TmuxClient::local().list_all())
     }
 }
 
@@ -1771,8 +1782,11 @@ async fn api_wake(
         )
             .into_response();
     }
+    // Resolved BEFORE the wake runs: the same pure resolver the command uses,
+    // so the answer is the window this call is about to act on.
+    let resolved = state.wake.resolved_target(&target);
     match state.wake.execute_wake(&target, parsed.task.as_deref()) {
-        Ok(_) => Json(json!({"ok": true, "target": target})).into_response(),
+        Ok(_) => Json(json!({"ok": true, "target": target, "resolved": resolved})).into_response(),
         Err(error) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"ok": false, "target": target, "error": error})),
