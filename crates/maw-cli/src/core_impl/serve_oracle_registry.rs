@@ -6,14 +6,23 @@
 // endpoint. maw-js only ever shipped the fallback, so the panel has always
 // taken the config path. Serving neither left `knownAgents` empty and the
 // panel unusable, which is what these two payloads fix.
+//
+// Both payloads read `config_load_layers()` only — the same merged
+// `maw.config.*.json` layers the Config tab (`/api/config-file`) edits — and
+// nothing else. They used to also merge in every `~/.maw/fleet/*.json` team
+// registration's window names, so a team member auto-registered by `maw wake`
+// stayed in the summon roster even after its fleet file went stale (repo
+// deleted, session long gone): the roster had two sources of truth that could
+// silently disagree. Team sub-agents aren't something a human picks from this
+// picker anyway — they're spawned by their lead — so the fix is to drop the
+// second source, not reconcile it.
 
 /// Only `commands` entries naming an oracle join the roster; the map also holds
 /// plain shell aliases.
 const SERVEORACLES_ORACLE_SUFFIX: &str = "-oracle";
 
 pub(crate) fn serveoracles_http_payload_read_only() -> Result<serde_json::Value, String> {
-    let mut config = config_load_layers()?.config;
-    serveoracles_merge_fleet_agents(&mut config, &fleet_load_entries());
+    let config = config_load_layers()?.config;
     Ok(serveoracles_payload_from_config(&config))
 }
 
@@ -31,45 +40,7 @@ pub(crate) fn serveoracles_http_payload_from_config_file(
 /// Masked config for `GET /api/config`.
 pub(crate) fn serveconfig_http_payload_read_only() -> Result<serde_json::Value, String> {
     let loaded = config_load_layers()?;
-    let mut config = loaded.config;
-    serveoracles_merge_fleet_agents(&mut config, &fleet_load_entries());
-    Ok(serveconfig_for_display(&config))
-}
-
-fn serveoracles_merge_fleet_agents(
-    config: &mut serde_json::Value,
-    fleet: &[NativeFleetEntry],
-) {
-    let local_node = config
-        .get("node")
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .filter(|node| !node.is_empty())
-        .unwrap_or("local")
-        .to_owned();
-    let serde_json::Value::Object(config_map) = config else {
-        return;
-    };
-    let agents = config_map
-        .entry("agents".to_owned())
-        .or_insert_with(|| serde_json::json!({}));
-    if !agents.is_object() {
-        *agents = serde_json::json!({});
-    }
-    let Some(agents_map) = agents.as_object_mut() else {
-        return;
-    };
-    for entry in fleet.iter().filter(|entry| fleet_entry_is_session(entry)) {
-        for window in &entry.session.windows {
-            let name = window.name.trim();
-            if !name.is_empty() && !agents_map.contains_key(name) {
-                agents_map.insert(
-                    name.to_owned(),
-                    serde_json::Value::String(local_node.clone()),
-                );
-            }
-        }
-    }
+    Ok(serveconfig_for_display(&loaded.config))
 }
 
 fn serveoracles_payload_from_config(config: &serde_json::Value) -> serde_json::Value {
@@ -401,7 +372,7 @@ mod serve_oracle_registry_tests {
     }
 
     #[test]
-    fn serveoracles_real_loader_merges_fleet_windows_into_agents() {
+    fn serveoracles_real_loader_ignores_fleet_windows() {
         let _lock = env_test_lock();
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -424,6 +395,9 @@ mod serve_oracle_registry_tests {
             r#"{"node":"m5","agents":{"atlas":"remote"},"sessions":{},"commands":{}}"#,
         )
         .expect("config");
+        // A stale fleet registration (e.g. a team member auto-registered by
+        // `maw wake`, its repo since deleted) must never leak into the
+        // roster: config is the only source of truth for both endpoints now.
         std::fs::write(
             fleet_dir.join("t4532-summon.json"),
             r#"{"name":"t4532-summon","windows":[{"name":"coder-serve-oracle","repo":"arnon2020/maw-rs"},{"name":"verifier-x-oracle","repo":"arnon2020/maw-rs"},{"name":"claim-verifier","repo":"arnon2020/lucifer-oracle"}]}"#,
@@ -435,15 +409,16 @@ mod serve_oracle_registry_tests {
 
         let roster = serveoracles_http_payload_read_only().expect("roster");
         let names = roster["oracles"].to_string();
-        assert!(names.contains("coder-serve"), "{names}");
-        assert!(names.contains("verifier-x"), "{names}");
-        assert!(names.contains("claim-verifier"), "{names}");
+        assert!(names.contains("atlas"), "{names}");
+        assert!(!names.contains("coder-serve"), "{names}");
+        assert!(!names.contains("verifier-x"), "{names}");
+        assert!(!names.contains("claim-verifier"), "{names}");
 
         let display = serveconfig_http_payload_read_only().expect("config display");
         assert_eq!(display["agents"]["atlas"], "remote");
-        assert_eq!(display["agents"]["coder-serve-oracle"], "m5");
-        assert_eq!(display["agents"]["verifier-x-oracle"], "m5");
-        assert_eq!(display["agents"]["claim-verifier"], "m5");
+        assert!(display["agents"].get("coder-serve-oracle").is_none());
+        assert!(display["agents"].get("verifier-x-oracle").is_none());
+        assert!(display["agents"].get("claim-verifier").is_none());
 
         let _ = std::fs::remove_dir_all(&root);
     }
