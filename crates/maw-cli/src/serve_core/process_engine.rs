@@ -221,6 +221,29 @@ fn serveengine_ws_text(text: &str, fallback_target: Option<&str>) -> String {
                 Err(error) => serveengine_ws_error(&error),
             }
         }
+        Some("sleep") => {
+            let target = match serveengine_ws_target(&value, fallback_target) {
+                Ok(target) => target,
+                Err(error) => return serveengine_ws_error(&error),
+            };
+            match serveengine_tmux_run(
+                "send-keys",
+                &["-t".to_owned(), target.clone(), "C-c".to_owned()],
+            ) {
+                Ok(_) => serde_json::json!({"type":"slept","target":target}).to_string(),
+                Err(error) => serveengine_ws_error(&error),
+            }
+        }
+        Some("stop") => {
+            let target = match serveengine_ws_target(&value, fallback_target) {
+                Ok(target) => target,
+                Err(error) => return serveengine_ws_error(&error),
+            };
+            match serveengine_tmux_run("kill-window", &["-t".to_owned(), target.clone()]) {
+                Ok(_) => serde_json::json!({"type":"stopped","target":target}).to_string(),
+                Err(error) => serveengine_ws_error(&error),
+            }
+        }
         Some(_) => serveengine_ws_error("unsupported_message"),
         None => serveengine_ws_error("missing_type"),
     }
@@ -587,8 +610,17 @@ mod tests {
     use std::{
         fs,
         os::unix::fs::PermissionsExt,
+        sync::OnceLock,
         time::{SystemTime, UNIX_EPOCH},
     };
+
+    // SERVEENGINE_FAKE_TMUX_LOG_ENV is process-global; serialize the tests that set it
+    // so parallel cargo-test threads don't clobber each other's env var / log file.
+    static FAKE_TMUX_LOG_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    fn fake_tmux_log_lock() -> &'static Mutex<()> {
+        FAKE_TMUX_LOG_LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     struct EnvGuard {
         key: &'static str,
@@ -717,6 +749,7 @@ printf '{{"cwd":"%s","argv":["%s","%s","%s","%s"]}}' "$(pwd)" "$1" "$2" "$3" "$4
 
     #[test]
     fn serveengine_native_ws_handles_terminal_messages_without_echo() {
+        let _lock = fake_tmux_log_lock().lock().expect("lock");
         let root = temp_dir("ws");
         let log = root.join("tmux.jsonl");
         let _guard = EnvGuard::set_path(SERVEENGINE_FAKE_TMUX_LOG_ENV, &log);
@@ -748,6 +781,70 @@ printf '{{"cwd":"%s","argv":["%s","%s","%s","%s"]}}' "$(pwd)" "$1" "$2" "$3" "$4
         assert!(log.contains(r#""send-keys""#));
         assert!(log.contains(r#""ls""#));
         fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn serveengine_native_ws_handles_sleep_and_stop() {
+        let _lock = fake_tmux_log_lock().lock().expect("lock");
+        let root = temp_dir("ws-sleep-stop");
+        let log = root.join("tmux.jsonl");
+        let _guard = EnvGuard::set_path(SERVEENGINE_FAKE_TMUX_LOG_ENV, &log);
+        let engine = ServecoreNativeEngine;
+
+        let reply = engine
+            .servecore_ws_text(
+                ServecoreWsKind::Engine,
+                r#"{"type":"sleep","target":"demo:1"}"#,
+                None,
+            )
+            .expect("reply");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&reply).expect("json")["type"],
+            "slept"
+        );
+
+        let reply = engine
+            .servecore_ws_text(
+                ServecoreWsKind::Engine,
+                r#"{"type":"stop","target":"demo:1"}"#,
+                None,
+            )
+            .expect("reply");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&reply).expect("json")["type"],
+            "stopped"
+        );
+
+        let log = fs::read_to_string(log).expect("tmux log");
+        assert!(log.contains(r#""send-keys""#));
+        assert!(log.contains(r#""C-c""#));
+        assert!(log.contains(r#""kill-window""#));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn serveengine_native_ws_sleep_and_stop_reject_bad_target() {
+        let engine = ServecoreNativeEngine;
+
+        let reply = engine
+            .servecore_ws_text(
+                ServecoreWsKind::Engine,
+                r#"{"type":"sleep","target":"bad;name"}"#,
+                None,
+            )
+            .expect("reply");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&reply).expect("json")["type"],
+            "error"
+        );
+
+        let reply = engine
+            .servecore_ws_text(ServecoreWsKind::Engine, r#"{"type":"stop"}"#, None)
+            .expect("reply");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&reply).expect("json")["type"],
+            "error"
+        );
     }
 
     #[test]
