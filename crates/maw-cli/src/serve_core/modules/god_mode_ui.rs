@@ -1516,6 +1516,18 @@ mod tests {
         }
     }
 
+    fn godui_ws_test_sessions() -> Vec<TmuxSession> {
+        vec![TmuxSession {
+            name: "142-athena".to_owned(),
+            windows: vec![maw_tmux::TmuxWindow {
+                index: 1,
+                name: "athena-oracle".to_owned(),
+                active: true,
+                cwd: Some("/opt/athena".to_owned()),
+            }],
+        }]
+    }
+
     #[test]
     fn godui_empty_payloads_match_maw_js_shapes() {
         let costs = godui_costs_payload();
@@ -1676,25 +1688,8 @@ mod tests {
     #[tokio::test]
     async fn godui_ws_route_streams_sessions_and_recent_from_module() {
         super::super::agent_status::agentstatus_reset_global();
-        let state = ServecoreSharedState::default().servecore_with_tmux_sessions_snapshot(vec![
-            TmuxSession {
-                name: "142-athena".to_owned(),
-                windows: vec![
-                    maw_tmux::TmuxWindow {
-                        index: 1,
-                        name: "athena-oracle".to_owned(),
-                        active: true,
-                        cwd: Some("/opt/athena".to_owned()),
-                    },
-                    maw_tmux::TmuxWindow {
-                        index: 2,
-                        name: "athena-codex-1".to_owned(),
-                        active: false,
-                        cwd: None,
-                    },
-                ],
-            },
-        ]);
+        let state = ServecoreSharedState::default()
+            .servecore_with_tmux_sessions_snapshot(godui_ws_test_sessions());
         let addr = godui_spawn_test_server(state).await;
         let (mut ws, _response) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
             .await
@@ -1721,7 +1716,7 @@ mod tests {
     async fn godui_ws_slow_action_keeps_heartbeat_and_reply_order() {
         let state = ServecoreSharedState::default()
             .servecore_with_engine(Arc::new(SlowWsActionEngine))
-            .servecore_with_tmux_sessions_snapshot(Vec::new());
+            .servecore_with_tmux_sessions_snapshot(godui_ws_test_sessions());
         let config = super::super::websocket_routes::WsConfig {
             idle_timeout: Duration::from_secs(2),
             heartbeat_interval: Duration::from_millis(25),
