@@ -424,10 +424,23 @@ async fn godui_ws_stream(
     let mut preview_targets = BTreeSet::new();
     let mut last_previews = BTreeMap::new();
     let mut registry_fingerprint = godui_registry_fingerprint();
+    let (action_tx, mut action_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut action_in_flight = false;
     let idle_timer = tokio::time::sleep(config.idle_timeout);
     tokio::pin!(idle_timer);
     loop {
         tokio::select! {
+            action = action_rx.recv(), if action_in_flight => {
+                action_in_flight = false;
+                let Some(Ok(reply)) = action else {
+                    break;
+                };
+                if let Some(reply) = reply {
+                    if servecore_ws_send(&mut socket, Message::Text(reply), config.send_timeout).await.is_err() {
+                        break;
+                    }
+                }
+            }
             _ = refresh.tick() => {
                 if !godui_ws_send_session_recent(&mut socket, &state, &config, &mut feed_cursor).await {
                     break;
@@ -467,7 +480,7 @@ async fn godui_ws_stream(
                 let _ = servecore_ws_send(&mut socket, Message::Close(None), config.send_timeout).await;
                 break;
             }
-            frame = socket.recv() => {
+            frame = socket.recv(), if !action_in_flight => {
                 match frame {
                     Some(Ok(frame)) => {
                         let resets_idle = !matches!(frame, Message::Pong(_));
@@ -490,6 +503,20 @@ async fn godui_ws_stream(
                         } else {
                             subscribed_target.clone().or_else(|| target.clone())
                         };
+                        if let Message::Text(text) = &frame {
+                            if text.len() <= config.max_frame_bytes
+                                && godui_ws_is_blocking_action(text)
+                            {
+                                godui_ws_spawn_blocking_action(
+                                    action_tx.clone(),
+                                    state.clone(),
+                                    text.clone(),
+                                    frame_target,
+                                );
+                                action_in_flight = true;
+                                continue;
+                            }
+                        }
                         if !servecore_ws_handle_frame(
                             &mut socket,
                             state.as_ref(),
@@ -511,6 +538,42 @@ async fn godui_ws_stream(
     state
         .engine
         .servecore_ws_close(ServecoreWsKind::Engine, target.as_deref());
+}
+
+type GoduiWsActionResult = Result<Option<String>, tokio::task::JoinError>;
+
+fn godui_ws_is_blocking_action(text: &str) -> bool {
+    serde_json::from_str::<Value>(text)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("type")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+        })
+        .is_some_and(|action| {
+            matches!(
+                action.as_str(),
+                "send" | "sleep" | "wake" | "restart" | "stop"
+            )
+        })
+}
+
+fn godui_ws_spawn_blocking_action(
+    tx: tokio::sync::mpsc::UnboundedSender<GoduiWsActionResult>,
+    state: Arc<ServecoreSharedState>,
+    text: String,
+    target: Option<String>,
+) {
+    drop(tokio::spawn(async move {
+        let result = tokio::task::spawn_blocking(move || {
+            state
+                .engine
+                .servecore_ws_text(ServecoreWsKind::Engine, &text, target.as_deref())
+        })
+        .await;
+        let _ = tx.send(result);
+    }));
 }
 
 async fn godui_ws_send_initial(
@@ -1594,6 +1657,20 @@ mod tests {
         );
 
         assert!(godui_ws_registry_changed_frame(&mut fingerprint, changed).is_none());
+    }
+
+    #[test]
+    fn godui_ws_blocking_action_set_is_complete() {
+        for action in ["send", "sleep", "wake", "restart", "stop"] {
+            assert!(godui_ws_is_blocking_action(
+                &json!({"type": action}).to_string()
+            ));
+        }
+        for action in ["subscribe", "select", "subscribe-previews"] {
+            assert!(!godui_ws_is_blocking_action(
+                &json!({"type": action}).to_string()
+            ));
+        }
     }
 
     #[tokio::test]
