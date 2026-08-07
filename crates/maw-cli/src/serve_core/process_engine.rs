@@ -29,6 +29,8 @@ const SERVEENGINE_FAKE_TMUX_LOG_ENV: &str = "MAW_RS_SERVECORE_FAKE_TMUX_LOG";
 const SERVEENGINE_FAKE_CAPTURE_ENV: &str = "MAW_RS_SERVECORE_FAKE_CAPTURE";
 const SERVEENGINE_PTY_PROGRAM_ENV: &str = "MAW_RS_SERVECORE_PTY_PROGRAM";
 const SERVEENGINE_PTY_TERM: &str = "screen-256color";
+/// Heartbeats a PTY client may pass without a word before we treat it as gone.
+const SERVEENGINE_PTY_MAX_SILENT_HEARTBEATS: u32 = 3;
 
 #[derive(Debug)]
 pub struct ServecoreNativeEngine;
@@ -532,6 +534,19 @@ pub(crate) async fn serveengine_ws_pty_stream(
     );
     let idle_timer = tokio::time::sleep(config.idle_timeout);
     tokio::pin!(idle_timer);
+    // A `tmux attach` PTY emits output forever (the status line reprints every
+    // second), so the idle timer alone never fires and cannot notice a client
+    // that walked away. Worse, a dev-server WebSocket proxy in front of us
+    // (vite's, measured) keeps its upstream connection ESTABLISHED after the
+    // browser is gone AND answers our Pings itself, so neither recv(), send(),
+    // nor Pong can tell us the viewer is gone. Without this counter the loop
+    // runs forever, the session is never dropped, and one `tmux attach` client
+    // stays welded to the agent's pane per page view.
+    //
+    // Only a Text or Binary frame counts as proof of life, because only the
+    // real client sends those — the UI emits `{"type":"keepalive"}` on a timer
+    // for exactly this purpose. A proxy relaying to nobody produces none.
+    let mut silent_heartbeats: u32 = 0;
     loop {
         tokio::select! {
             pty = async {
@@ -549,6 +564,10 @@ pub(crate) async fn serveengine_ws_pty_stream(
                 None => break,
             },
             _ = heartbeat.tick() => {
+                if silent_heartbeats >= SERVEENGINE_PTY_MAX_SILENT_HEARTBEATS {
+                    break;
+                }
+                silent_heartbeats += 1;
                 if servecore_ws_send(&mut socket, Message::Ping(Vec::new()), config.send_timeout).await.is_err() {
                     break;
                 }
@@ -560,6 +579,9 @@ pub(crate) async fn serveengine_ws_pty_stream(
             frame = socket.recv() => match frame {
                 Some(Ok(frame)) => {
                     idle_timer.as_mut().reset(tokio::time::Instant::now() + config.idle_timeout);
+                    if matches!(frame, Message::Text(_) | Message::Binary(_)) {
+                        silent_heartbeats = 0;
+                    }
                     if !serveengine_ws_pty_frame(&mut socket, &state, fallback_target.as_deref(), &mut session, &mut pty_rx, config, frame).await {
                         break;
                     }
@@ -644,12 +666,23 @@ async fn serveengine_ws_pty_text(
             match serveengine_pty_attach(state, &value, fallback_target) {
                 Ok((pty, rx)) => {
                     let target = pty.target.clone();
+                    // Report the size the PTY was actually opened at. The browser
+                    // adopts it instead of imposing its own viewport width, which
+                    // is what used to resize the agent's real tmux window on every
+                    // attach and re-wrap whatever sat in the pane's input box.
+                    let (cols, rows) = (pty.size.cols, pty.size.rows);
                     *session = Some(pty);
                     *pty_rx = Some(rx);
                     servecore_ws_send(
                         socket,
                         Message::Text(
-                            serde_json::json!({"type":"attached","target":target}).to_string(),
+                            serde_json::json!({
+                                "type":"attached",
+                                "target":target,
+                                "cols":cols,
+                                "rows":rows,
+                            })
+                            .to_string(),
                         ),
                         config.send_timeout,
                     )
@@ -676,6 +709,9 @@ async fn serveengine_ws_pty_text(
             let size = serveengine_pty_size(&value);
             pty.master.resize(size).is_ok()
         }),
+        // Proof the viewer is still there. Needs no reply — receiving it is the
+        // whole point; see the silent_heartbeats counter in the stream loop.
+        Some("keepalive") => true,
         Some("detach") => false,
         _ => servecore_ws_send(
             socket,
@@ -689,6 +725,8 @@ async fn serveengine_ws_pty_text(
 
 struct ServeenginePtySession {
     target: String,
+    size: PtySize,
+    pid: Option<u32>,
     master: Box<dyn portable_pty::MasterPty + Send>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     killer: Box<dyn portable_pty::ChildKiller + Send + Sync>,
@@ -709,8 +747,42 @@ impl ServeenginePtySession {
 
 impl Drop for ServeenginePtySession {
     fn drop(&mut self) {
+        // portable-pty 0.9's cloned killer only raises SIGHUP (its
+        // ProcessSignaller::kill). SIGHUP is enough for `tmux attach`
+        // (measured), but SERVEENGINE_PTY_PROGRAM_ENV lets any program stand in
+        // here, and one that installs a SIGHUP handler would stay attached to
+        // the pane forever. Ask nicely, then make sure.
         let _ = self.killer.kill();
+        serveengine_force_kill(self.pid);
     }
+}
+
+/// SIGKILL the PTY child if SIGHUP left it running. Shells out rather than
+/// pulling in a libc dependency; this path is already unix-and-tmux specific.
+fn serveengine_force_kill(pid: Option<u32>) {
+    let Some(pid) = pid else { return };
+    let alive = |pid: u32| {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    };
+    // Give the SIGHUP a short grace period before escalating.
+    for attempt in 0..5 {
+        if attempt > 0 {
+            std::thread::sleep(Duration::from_millis(40));
+        }
+        if !alive(pid) {
+            return;
+        }
+    }
+    let _ = std::process::Command::new("kill")
+        .args(["-KILL", &pid.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
 }
 
 fn serveengine_pty_attach(
@@ -726,8 +798,12 @@ fn serveengine_pty_attach(
 > {
     let target =
         serveengine_pty_resolve_target(state, &serveengine_ws_target(value, fallback_target)?)?;
+    // Prefer the size the pane already has. Opening the PTY at the browser's
+    // viewport size makes this `tmux attach` the newest client, and with
+    // window-size=latest that silently resizes the agent's window for everyone.
+    let size = serveengine_pane_pty_size(&target).unwrap_or_else(|| serveengine_pty_size(value));
     let pair = portable_pty::native_pty_system()
-        .openpty(serveengine_pty_size(value))
+        .openpty(size)
         .map_err(|error| format!("pty_open_failed: {error}"))?;
     let mut child = pair
         .slave
@@ -735,6 +811,7 @@ fn serveengine_pty_attach(
         .map_err(|error| format!("pty_spawn_failed: {error}"))?;
     drop(pair.slave);
     let killer = child.clone_killer();
+    let pid = child.process_id();
     std::thread::spawn(move || {
         let _ = child.wait();
     });
@@ -752,12 +829,51 @@ fn serveengine_pty_attach(
     Ok((
         ServeenginePtySession {
             target,
+            size,
+            pid,
             master: pair.master,
             writer,
             killer,
         },
         rx,
     ))
+}
+
+/// The PTY size that leaves the pane exactly as it is: the window's own
+/// dimensions plus however many rows tmux reserves for its status line, since
+/// tmux subtracts those from the attaching client's terminal height.
+fn serveengine_pane_pty_size(target: &str) -> Option<PtySize> {
+    let reported = serveengine_tmux_run(
+        "display-message",
+        &[
+            "-p".to_owned(),
+            "-t".to_owned(),
+            target.to_owned(),
+            "#{window_width} #{window_height} #{status}".to_owned(),
+        ],
+    )
+    .ok()?;
+    let mut fields = reported.split_whitespace();
+    let cols = fields.next()?.parse::<u16>().ok()?;
+    let rows = fields.next()?.parse::<u16>().ok()?;
+    if cols == 0 || rows == 0 {
+        return None;
+    }
+    let status = fields.next().map_or(1, serveengine_status_lines);
+    Some(PtySize {
+        rows: rows.saturating_add(status),
+        cols,
+        pixel_width: 0,
+        pixel_height: 0,
+    })
+}
+
+fn serveengine_status_lines(reported: &str) -> u16 {
+    match reported {
+        "off" => 0,
+        "on" => 1,
+        other => other.parse().unwrap_or(1),
+    }
 }
 
 fn serveengine_pty_read_loop(
