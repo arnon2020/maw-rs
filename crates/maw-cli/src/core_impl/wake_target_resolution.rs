@@ -76,6 +76,22 @@ fn wake_target_is_resolvable(target: &str, sessions: &[TmuxSession]) -> bool {
     wake_resolve(&options, sessions).is_ok_and(|resolved| resolved.repo_fuzzy_match.is_none())
 }
 
+/// The `session:window` a plain `maw wake <target>` would land on, without
+/// touching tmux. `None` when the target needs the picker or cannot resolve.
+///
+/// Callers that wake on someone else's behalf (`/api/wake`, and the summon
+/// button in front of it) report this back so a resolution that lands on an
+/// unexpected window is visible at the call site instead of only in the pane
+/// that woke up.
+fn wake_resolved_target(target: &str, sessions: &[TmuxSession]) -> Option<String> {
+    let argv = vec![target.to_owned(), "--no-attach".to_owned()];
+    let options = wake_parse_args(&argv).ok()?;
+    if wake_picker_rows(&options, sessions).is_some() {
+        return None;
+    }
+    wake_resolve(&options, sessions).ok().map(|resolved| resolved.target)
+}
+
 fn wake_oracle(options: &WakeOptionsNative) -> Result<String, String> {
     let slug = workon_github_slug(&options.target);
     let raw = options
@@ -383,7 +399,7 @@ fn wake_typed_registry_candidates(
                 candidate: maw_matcher::ResolveTypedCandidate {
                     kind,
                     name,
-                    aliases: wake_registry_aliases(window, &oracle),
+                    aliases: wake_registry_aliases(window, &entry.session.name, &oracle),
                 },
                 oracle,
                 window: window.name.clone(),
@@ -402,12 +418,44 @@ fn wake_registry_window_is_live(entry: &NativeFleetEntry, window: &NativeFleetWi
         .any(|session| session.name == entry.session.name && session.windows.iter().any(|live| live.name == window.name))
 }
 
-fn wake_registry_aliases(window: &NativeFleetWindow, oracle: &str) -> Vec<String> {
-    let mut aliases = vec![window.name.clone(), oracle.to_owned()];
-    if let Some(repo_name) = window.repo.rsplit('/').next().filter(|name| !name.is_empty()) { aliases.push(repo_name.to_owned()); }
+fn wake_registry_aliases(window: &NativeFleetWindow, session: &str, oracle: &str) -> Vec<String> {
+    let mut aliases = vec![window.name.clone()];
+    // Repo-derived aliases (the oracle name and the repo basename) are only
+    // handed to windows that actually speak for that oracle -- see
+    // `wake_window_speaks_for_oracle`. A worker parked in someone else's repo
+    // from a foreign session (`lao-index:scout-oracle`, cwd
+    // `arnon2020/holmes-oracle`) otherwise answers to `holmes`, and when it is
+    // the only registry window on that repo it answers ALONE: one candidate,
+    // no tie, so neither live_tiebreak nor literal_name_tiebreak ever runs and
+    // nothing flags it. `maw wake holmes` -- and the UI summon button that
+    // POSTs /api/wake -- then resumed the worker instead of waking the oracle.
+    if wake_window_speaks_for_oracle(&window.name, session, oracle) {
+        aliases.push(oracle.to_owned());
+        if let Some(repo_name) = window.repo.rsplit('/').next().filter(|name| !name.is_empty()) { aliases.push(repo_name.to_owned()); }
+    }
     aliases.sort();
     aliases.dedup();
     aliases
+}
+
+/// Whether a registry window may answer to its repo's oracle name.
+///
+/// Two ways to earn it: carry the name (`holmes` / `holmes-oracle` -- the same
+/// primary-window rule `wake_primary_registry_window` applies on the
+/// exact-session path), or sit in the oracle's own session, which keeps #711's
+/// fan-out siblings (`05-rpro-ent:rpro-ent-codex-1`) speaking for it and
+/// keeps that issue's ambiguity policy exactly as decided. A worker in a
+/// foreign team session earns neither.
+fn wake_window_speaks_for_oracle(window: &str, session: &str, oracle: &str) -> bool {
+    let oracle = oracle.trim().to_lowercase();
+    if oracle.is_empty() {
+        return false;
+    }
+    let names = [
+        window.trim().to_lowercase(),
+        maw_identity::parse_session_name(session).stem.trim().to_lowercase(),
+    ];
+    names.iter().any(|name| *name == oracle || *name == format!("{oracle}-oracle"))
 }
 
 fn wake_typed_repo_candidates(fleet_entries: &[NativeFleetEntry]) -> Vec<WakeTypedRepoCandidate> {
@@ -508,6 +556,12 @@ fn wake_detect_session_from_fleet_registry(oracle: &str, repo_path: &std::path::
         for window in &entry.session.windows {
             let repo_name = window.repo.rsplit('/').next().unwrap_or_default();
             if !wake_repo_name_matches(repo_name, oracle) {
+                continue;
+            }
+            // Same rule as the alias gate: a foreign team session that merely
+            // parked a worker in this oracle's repo is not the oracle's home,
+            // so waking the oracle must not drop its window in there.
+            if !wake_window_speaks_for_oracle(&window.name, &entry.session.name, oracle) {
                 continue;
             }
             let Some(path) = native_fleet_repo_path(&window.repo) else { continue; };
