@@ -1386,14 +1386,14 @@ mod tests {
     use super::*;
     use crate::serve_core::{
         modules::servecore_mount_modules, servecore_apply_pipeline, servecore_mount_core_routes,
-        servecore_with_shared_state,
+        servecore_with_shared_state, ServecoreEngine,
     };
     use axum::{
         body::Body,
         http::{Method, Request, StatusCode},
         Router,
     };
-    use futures_util::StreamExt;
+    use futures_util::{SinkExt, StreamExt};
     use std::{
         net::{Ipv4Addr, SocketAddr},
         time::Duration,
@@ -1422,6 +1422,33 @@ mod tests {
             match &self.1 {
                 Some(value) => std::env::set_var(self.0, value),
                 None => std::env::remove_var(self.0),
+            }
+        }
+    }
+
+    struct SlowWsActionEngine;
+
+    impl ServecoreEngine for SlowWsActionEngine {
+        fn servecore_engine_name(&self) -> &'static str {
+            "slow-ws-action"
+        }
+
+        fn servecore_ws_text(
+            &self,
+            _kind: ServecoreWsKind,
+            text: &str,
+            _target: Option<&str>,
+        ) -> Option<String> {
+            let value = serde_json::from_str::<Value>(text).expect("action json");
+            match value.get("type").and_then(Value::as_str) {
+                Some("wake") => {
+                    std::thread::sleep(Duration::from_millis(200));
+                    Some(json!({"type":"woke","target":"demo:1"}).to_string())
+                }
+                Some("subscribe") => {
+                    Some(json!({"type":"subscribed","target":"demo:1"}).to_string())
+                }
+                _ => Some(json!({"type":"error","error":"unexpected_test_action"}).to_string()),
             }
         }
     }
@@ -1611,6 +1638,80 @@ mod tests {
         assert_eq!(frames[1]["sessions"][0]["windows"][0]["status"], "idle");
         assert_eq!(frames[2]["type"], "recent");
         assert_eq!(frames[2]["agents"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn godui_ws_slow_action_keeps_heartbeat_and_reply_order() {
+        let state = ServecoreSharedState::default()
+            .servecore_with_engine(Arc::new(SlowWsActionEngine))
+            .servecore_with_tmux_sessions_snapshot(Vec::new());
+        let config = super::super::websocket_routes::WsConfig {
+            idle_timeout: Duration::from_secs(2),
+            heartbeat_interval: Duration::from_millis(25),
+            capture_interval: Duration::from_secs(1),
+            previews_interval: Duration::from_secs(1),
+            send_timeout: Duration::from_secs(1),
+            max_frame_bytes: 64 * 1024,
+            max_connections: 8,
+        };
+        let addr = godui_spawn_test_server_with_config(state, config).await;
+        let (mut ws, _response) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+            .await
+            .expect("connect websocket");
+        let mut initial_text_frames = 0;
+        while initial_text_frames < 3 {
+            if matches!(
+                ws.next().await.expect("initial frame").expect("frame ok"),
+                tokio_tungstenite::tungstenite::Message::Text(_)
+            ) {
+                initial_text_frames += 1;
+            }
+        }
+
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            r#"{"type":"wake","target":"demo:1"}"#.into(),
+        ))
+        .await
+        .expect("send wake");
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            r#"{"type":"subscribe","target":"demo:1"}"#.into(),
+        ))
+        .await
+        .expect("queue subscribe");
+
+        tokio::time::timeout(Duration::from_millis(100), async {
+            loop {
+                match ws.next().await.expect("heartbeat frame").expect("frame ok") {
+                    tokio_tungstenite::tungstenite::Message::Ping(_) => break,
+                    tokio_tungstenite::tungstenite::Message::Text(text) => {
+                        let value =
+                            serde_json::from_str::<Value>(&text).expect("heartbeat-phase json");
+                        assert_ne!(value["type"], "woke", "action completed before heartbeat");
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("heartbeat must continue while action runs");
+
+        let replies = tokio::time::timeout(Duration::from_secs(1), async {
+            let mut replies = Vec::new();
+            while replies.len() < 2 {
+                if let tokio_tungstenite::tungstenite::Message::Text(text) =
+                    ws.next().await.expect("reply frame").expect("frame ok")
+                {
+                    let value = serde_json::from_str::<Value>(&text).expect("reply json");
+                    if matches!(value["type"].as_str(), Some("woke" | "subscribed")) {
+                        replies.push(value["type"].as_str().expect("reply type").to_owned());
+                    }
+                }
+            }
+            replies
+        })
+        .await
+        .expect("ordered action replies");
+        assert_eq!(replies, ["woke", "subscribed"]);
     }
 
     #[test]
@@ -2431,6 +2532,32 @@ mod tests {
         let addr = listener.local_addr().expect("addr");
         let router = servecore_mount_core_routes(Router::new());
         let router = servecore_mount_modules(router, &["god-ui".to_owned()]);
+        let router = servecore_with_shared_state(router, state);
+        let app = servecore_apply_pipeline(router);
+        let (tx, rx) = oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let server = axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(async move {
+                let _ = rx.await;
+            });
+            server.await.expect("server");
+        });
+        std::mem::forget(tx);
+        addr
+    }
+
+    async fn godui_spawn_test_server_with_config(
+        state: ServecoreSharedState,
+        config: super::super::websocket_routes::WsConfig,
+    ) -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let router = Router::new().route("/ws", get(godui_ws_upgrade).layer(Extension(config)));
         let router = servecore_with_shared_state(router, state);
         let app = servecore_apply_pipeline(router);
         let (tx, rx) = oneshot::channel::<()>();
