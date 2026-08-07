@@ -193,25 +193,40 @@ fn serveengine_resolve_capture_target(target: &str, sessions: &[TmuxSession]) ->
 }
 
 fn serveengine_ws_text(text: &str, fallback_target: Option<&str>) -> String {
+    serveengine_ws_text_with_runner(text, fallback_target, &ServecoreProcessRunner)
+}
+
+fn serveengine_ws_text_with_runner(
+    text: &str,
+    fallback_target: Option<&str>,
+    runner: &dyn ServecoreExecRunner,
+) -> String {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
-        return serveengine_ws_error("invalid_json");
+        return serveengine_ws_error("invalid_json", None, None);
     };
+    let context_target = value
+        .get("target")
+        .and_then(serde_json::Value::as_str)
+        .or(fallback_target);
     match value.get("type").and_then(serde_json::Value::as_str) {
-        Some("subscribe" | "select") => serveengine_ws_target(&value, fallback_target).map_or_else(
-            |error| serveengine_ws_error(&error),
-            |target| serde_json::json!({"type":"subscribed","target":target}).to_string(),
-        ),
+        Some(action @ ("subscribe" | "select")) => serveengine_ws_target(&value, fallback_target)
+            .map_or_else(
+                |error| serveengine_ws_error(&error, Some(action), context_target),
+                |target| serde_json::json!({"type":"subscribed","target":target}).to_string(),
+            ),
         Some("send") => {
             let target = match serveengine_ws_target(&value, fallback_target) {
                 Ok(target) => target,
-                Err(error) => return serveengine_ws_error(&error),
+                Err(error) => {
+                    return serveengine_ws_error(&error, Some("send"), context_target);
+                }
             };
             let Some(text) = value
                 .get("text")
                 .or_else(|| value.get("content"))
                 .and_then(serde_json::Value::as_str)
             else {
-                return serveengine_ws_error("missing_text");
+                return serveengine_ws_error("missing_text", Some("send"), Some(&target));
             };
             match serveengine_tmux_send(
                 &target,
@@ -222,44 +237,46 @@ fn serveengine_ws_text(text: &str, fallback_target: Option<&str>) -> String {
                     .unwrap_or(false),
             ) {
                 Ok(()) => serde_json::json!({"type":"sent","target":target}).to_string(),
-                Err(error) => serveengine_ws_error(&error),
+                Err(error) => serveengine_ws_error(&error, Some("send"), Some(&target)),
             }
         }
         Some("sleep") => {
             let target = match serveengine_ws_target(&value, fallback_target) {
                 Ok(target) => target,
-                Err(error) => return serveengine_ws_error(&error),
+                Err(error) => {
+                    return serveengine_ws_error(&error, Some("sleep"), context_target);
+                }
             };
             match serveengine_tmux_run(
                 "send-keys",
                 &["-t".to_owned(), target.clone(), "C-c".to_owned()],
             ) {
                 Ok(_) => serde_json::json!({"type":"slept","target":target}).to_string(),
-                Err(error) => serveengine_ws_error(&error),
+                Err(error) => serveengine_ws_error(&error, Some("sleep"), Some(&target)),
             }
         }
-        Some("wake") => serveengine_ws_wake(&value, fallback_target, &ServecoreProcessRunner)
-            .map_or_else(
-                |error| serveengine_ws_error(&error),
-                |target| serveengine_woke_reply(&target),
-            ),
-        Some("restart") => serveengine_ws_restart(&value, fallback_target, &ServecoreProcessRunner)
-            .map_or_else(
-                |error| serveengine_ws_error(&error),
-                |target| serveengine_restarted_reply(&target),
-            ),
+        Some("wake") => serveengine_ws_wake(&value, fallback_target, runner).map_or_else(
+            |error| serveengine_ws_error(&error, Some("wake"), context_target),
+            |target| serveengine_woke_reply(&target),
+        ),
+        Some("restart") => serveengine_ws_restart(&value, fallback_target, runner).map_or_else(
+            |error| serveengine_ws_error(&error, Some("restart"), context_target),
+            |target| serveengine_restarted_reply(&target),
+        ),
         Some("stop") => {
             let target = match serveengine_ws_target(&value, fallback_target) {
                 Ok(target) => target,
-                Err(error) => return serveengine_ws_error(&error),
+                Err(error) => {
+                    return serveengine_ws_error(&error, Some("stop"), context_target);
+                }
             };
             match serveengine_tmux_run("kill-window", &["-t".to_owned(), target.clone()]) {
                 Ok(_) => serde_json::json!({"type":"stopped","target":target}).to_string(),
-                Err(error) => serveengine_ws_error(&error),
+                Err(error) => serveengine_ws_error(&error, Some("stop"), Some(&target)),
             }
         }
-        Some(_) => serveengine_ws_error("unsupported_message"),
-        None => serveengine_ws_error("missing_type"),
+        Some(action) => serveengine_ws_error("unsupported_message", Some(action), context_target),
+        None => serveengine_ws_error("missing_type", None, context_target),
     }
 }
 
@@ -382,8 +399,17 @@ fn serveengine_tmux_run(subcommand: &str, args: &[String]) -> Result<String, Str
     maw_tmux::TmuxRunner::run(&mut runner, subcommand, args).map_err(|error| error.message)
 }
 
-fn serveengine_ws_error(error: &str) -> String {
-    serde_json::json!({"type":"error","error":error}).to_string()
+fn serveengine_ws_error(error: &str, action: Option<&str>, target: Option<&str>) -> String {
+    let mut frame = serde_json::Map::new();
+    frame.insert("type".to_owned(), "error".into());
+    frame.insert("error".to_owned(), error.into());
+    if let Some(action) = action {
+        frame.insert("action".to_owned(), action.into());
+    }
+    if let Some(target) = target {
+        frame.insert("target".to_owned(), target.into());
+    }
+    serde_json::Value::Object(frame).to_string()
 }
 
 pub(crate) async fn serveengine_ws_tmux_stream(
@@ -455,7 +481,7 @@ async fn serveengine_ws_tmux_frame(
             } else {
                 servecore_ws_send(
                     socket,
-                    Message::Text(serveengine_ws_error("unsupported_message")),
+                    Message::Text(serveengine_ws_error("unsupported_message", None, None)),
                     config.send_timeout,
                 )
                 .await
@@ -633,7 +659,7 @@ async fn serveengine_ws_pty_text(
     let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
         return servecore_ws_send(
             socket,
-            Message::Text(serveengine_ws_error("invalid_json")),
+            Message::Text(serveengine_ws_error("invalid_json", None, None)),
             config.send_timeout,
         )
         .await
@@ -658,7 +684,7 @@ async fn serveengine_ws_pty_text(
                 }
                 Err(error) => servecore_ws_send(
                     socket,
-                    Message::Text(serveengine_ws_error(&error)),
+                    Message::Text(serveengine_ws_error(&error, None, None)),
                     config.send_timeout,
                 )
                 .await
@@ -667,7 +693,7 @@ async fn serveengine_ws_pty_text(
         }
         Some("attach") => servecore_ws_send(
             socket,
-            Message::Text(serveengine_ws_error("already_attached")),
+            Message::Text(serveengine_ws_error("already_attached", None, None)),
             config.send_timeout,
         )
         .await
@@ -679,7 +705,7 @@ async fn serveengine_ws_pty_text(
         Some("detach") => false,
         _ => servecore_ws_send(
             socket,
-            Message::Text(serveengine_ws_error("unsupported_message")),
+            Message::Text(serveengine_ws_error("unsupported_message", None, None)),
             config.send_timeout,
         )
         .await
@@ -906,6 +932,14 @@ mod tests {
         }
     }
 
+    struct FailingRunner;
+
+    impl ServecoreExecRunner for FailingRunner {
+        fn servecore_run(&self, _argv: &[String], _cwd: &Path) -> Result<(), String> {
+            Err("serve-orchestration: workon exited with exit status: 2".to_owned())
+        }
+    }
+
     #[test]
     fn serveengine_self_bin_uses_env() {
         let root = temp_dir("self-bin");
@@ -1089,6 +1123,35 @@ printf '{{"cwd":"%s","argv":["%s","%s","%s","%s"]}}' "$(pwd)" "$1" "$2" "$3" "$4
             ]
         );
         assert!(calls[0].1.is_dir());
+    }
+
+    #[test]
+    fn serveengine_native_ws_wake_error_includes_action_and_target() {
+        let reply = serveengine_ws_text_with_runner(
+            r#"{"type":"wake","target":"ws-parity-missing:999"}"#,
+            None,
+            &FailingRunner,
+        );
+
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&reply).expect("json"),
+            serde_json::json!({
+                "type": "error",
+                "error": "serve-orchestration: workon exited with exit status: 2",
+                "action": "wake",
+                "target": "ws-parity-missing:999",
+            })
+        );
+    }
+
+    #[test]
+    fn serveengine_native_ws_context_free_error_omits_action_and_target() {
+        let reply = serveengine_ws_text("not-json", None);
+
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&reply).expect("json"),
+            serde_json::json!({"type": "error", "error": "invalid_json"})
+        );
     }
 
     #[test]
