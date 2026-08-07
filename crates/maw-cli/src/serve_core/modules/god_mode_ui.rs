@@ -423,6 +423,7 @@ async fn godui_ws_stream(
     let mut subscribed_target = target.clone();
     let mut preview_targets = BTreeSet::new();
     let mut last_previews = BTreeMap::new();
+    let mut registry_fingerprint = godui_registry_fingerprint();
     let idle_timer = tokio::time::sleep(config.idle_timeout);
     tokio::pin!(idle_timer);
     loop {
@@ -430,6 +431,14 @@ async fn godui_ws_stream(
             _ = refresh.tick() => {
                 if !godui_ws_send_session_recent(&mut socket, &state, &config, &mut feed_cursor).await {
                     break;
+                }
+                if let Some(frame) = godui_ws_registry_changed_frame(
+                    &mut registry_fingerprint,
+                    godui_registry_fingerprint(),
+                ) {
+                    if servecore_ws_send(&mut socket, Message::Text(frame), config.send_timeout).await.is_err() {
+                        break;
+                    }
                 }
                 idle_timer.as_mut().reset(tokio::time::Instant::now() + config.idle_timeout);
             }
@@ -854,6 +863,23 @@ fn godui_ws_session_recent_frames_with_snapshot(
 
 fn godui_ws_json_text(value: &Value) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| "{}".to_owned())
+}
+
+fn godui_registry_fingerprint() -> Result<Value, String> {
+    // Compare the same roster payload the client refetches, so edits to unrelated
+    // config keys do not trigger a redundant registry request.
+    crate::core_impl::serveoracles_http_payload_read_only()
+}
+
+fn godui_ws_registry_changed_frame(
+    previous: &mut Result<Value, String>,
+    current: Result<Value, String>,
+) -> Option<String> {
+    if *previous == current {
+        return None;
+    }
+    *previous = current;
+    Some(godui_ws_json_text(&json!({"type": "registry-changed"})))
 }
 
 fn godui_ws_selected_target(text: &str) -> Option<String> {
@@ -1523,6 +1549,24 @@ mod tests {
             last_previews,
             BTreeMap::from([("demo:2".to_owned(), "old 2".to_owned())])
         );
+    }
+
+    #[test]
+    fn godui_ws_registry_changed_emits_once_per_fingerprint_change() {
+        let initial = Ok(json!({"oracles": ["atlas"]}));
+        let changed = Ok(json!({"oracles": ["atlas", "hound"]}));
+        let mut fingerprint = initial.clone();
+
+        assert!(godui_ws_registry_changed_frame(&mut fingerprint, initial).is_none());
+
+        let frame =
+            godui_ws_registry_changed_frame(&mut fingerprint, changed.clone()).expect("change");
+        assert_eq!(
+            serde_json::from_str::<Value>(&frame).expect("json"),
+            json!({"type": "registry-changed"})
+        );
+
+        assert!(godui_ws_registry_changed_frame(&mut fingerprint, changed).is_none());
     }
 
     #[tokio::test]
